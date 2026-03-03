@@ -29,14 +29,45 @@ class AnalyticsScreen extends StatefulWidget {
 class _AnalyticsScreenState extends State<AnalyticsScreen> {
   final _db = DatabaseHelper.instance;
   List<Map<String, dynamic>> _playerStats = [];
+  List<Map<String, dynamic>> _filteredStats = [];
   bool _loading = true;
   String _sortBy = 'runs'; // 'runs', 'average', 'strike_rate', 'wickets', 'economy'
   bool _ascending = false;
+
+  final TextEditingController _searchController = TextEditingController();
+  String _searchQuery = '';
 
   @override
   void initState() {
     super.initState();
     _loadPlayerStats();
+    _searchController.addListener(_onSearchChanged);
+  }
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
+
+  void _onSearchChanged() {
+    final q = _searchController.text.trim().toLowerCase();
+    setState(() {
+      _searchQuery = q;
+      _applyFilter();
+    });
+  }
+
+  void _applyFilter() {
+    if (_searchQuery.isEmpty) {
+      _filteredStats = List.of(_playerStats);
+    } else {
+      _filteredStats = _playerStats.where((p) {
+        final name = (p['name'] as String).toLowerCase();
+        final team = (p['team'] as String).toLowerCase();
+        return name.contains(_searchQuery) || team.contains(_searchQuery);
+      }).toList();
+    }
   }
 
   Future<void> _loadPlayerStats() async {
@@ -75,6 +106,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
       setState(() {
         _playerStats = stats;
         _loading = false;
+        _applyFilter();
       });
     } catch (e) {
       debugPrint('Error loading player stats: $e');
@@ -269,6 +301,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
         _ascending = false;
       }
       _sortStats(_playerStats);
+      _applyFilter();
     });
   }
 
@@ -322,6 +355,8 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
               SliverToBoxAdapter(
                 child: _buildBowlersChart(),
               ),
+            // ── Search bar ──────────────────────────────────────────────
+            _buildSearchBar(),
             // ── Sort chips + player cards ───────────────────────────────
             _buildSortChips(),
             _buildStatsList(),
@@ -695,6 +730,60 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
   }
 
   // ══════════════════════════════════════════════════════════════════════════
+  // SEARCH BAR
+  // ══════════════════════════════════════════════════════════════════════════
+
+  Widget _buildSearchBar() {
+    return SliverToBoxAdapter(
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(12),
+          child: TextField(
+            controller: _searchController,
+            style: GoogleFonts.rajdhani(
+              fontSize: 15,
+              color: _textPrimary,
+              fontWeight: FontWeight.w600,
+            ),
+            decoration: InputDecoration(
+              hintText: 'Search player or team…',
+              hintStyle: GoogleFonts.rajdhani(
+                fontSize: 15,
+                color: _textSecondary,
+              ),
+              prefixIcon: const Icon(Icons.search, color: _accentGreen, size: 20),
+              suffixIcon: _searchQuery.isNotEmpty
+                  ? GestureDetector(
+                      onTap: () {
+                        _searchController.clear();
+                      },
+                      child: const Icon(Icons.close, color: _textSecondary, size: 18),
+                    )
+                  : null,
+              filled: true,
+              fillColor: _glassBg,
+              contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(12),
+                borderSide: const BorderSide(color: _glassBorder, width: 1),
+              ),
+              enabledBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(12),
+                borderSide: const BorderSide(color: _glassBorder, width: 1),
+              ),
+              focusedBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(12),
+                borderSide: const BorderSide(color: _accentGreen, width: 1.5),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
   // SORT CHIPS
   // ══════════════════════════════════════════════════════════════════════════
 
@@ -767,12 +856,27 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
   // ══════════════════════════════════════════════════════════════════════════
 
   Widget _buildStatsList() {
+    final list = _filteredStats;
+    if (list.isEmpty && _searchQuery.isNotEmpty) {
+      return SliverToBoxAdapter(
+        child: Padding(
+          padding: const EdgeInsets.all(32),
+          child: Center(
+            child: Text(
+              'No players match "$_searchQuery"',
+              style: GoogleFonts.rajdhani(fontSize: 15, color: _textSecondary),
+              textAlign: TextAlign.center,
+            ),
+          ),
+        ),
+      );
+    }
     return SliverPadding(
       padding: const EdgeInsets.all(16),
       sliver: SliverList(
         delegate: SliverChildBuilderDelegate(
-          (context, index) => _buildPlayerCard(_playerStats[index]),
-          childCount: _playerStats.length,
+          (context, index) => _buildPlayerCard(list[index]),
+          childCount: list.length,
         ),
       ),
     );

@@ -152,6 +152,10 @@ class TournamentProvider extends ChangeNotifier {
   ///   NRR = (Σ runs scored / Σ overs faced) − (Σ runs conceded / Σ overs bowled)
   ///
   /// Overs are expressed as decimal fractions: e.g. 18.4 overs = 18 + 4/6 ≈ 18.667.
+  ///
+  /// All-out rule (ICC): if a team loses all wickets (is bowled out) BEFORE their
+  /// full quota of overs, the denominator is set to the MAXIMUM scheduled overs
+  /// (not the actual overs they survived).
   Future<List<TeamStanding>> buildPointsTable(int tournamentId) async {
     final db = DatabaseHelper.instance;
 
@@ -161,16 +165,24 @@ class TournamentProvider extends ChangeNotifier {
         .where((m) => m[DatabaseHelper.colStatus] == 'completed')
         .toList();
 
-    // Fetch tournament to get registered team list
+    // Fetch tournament to get registered team list — prefer tournament_teams
+    // table over the legacy comma-separated string so late-entry teams appear.
     final tournament = await db.fetchTournament(tournamentId);
     if (tournament == null) return [];
 
-    final teamsRaw = (tournament[DatabaseHelper.colTeams] as String?) ?? '';
-    final teamNames = teamsRaw
-        .split(',')
-        .map((t) => t.trim())
-        .where((t) => t.isNotEmpty)
-        .toList();
+    final teamRows = await db.fetchAllTournamentTeamRows(tournamentId);
+    List<String> teamNames;
+    if (teamRows.isNotEmpty) {
+      teamNames = teamRows.map((r) => r[DatabaseHelper.colTeamName] as String).toList();
+    } else {
+      // Fallback: legacy comma-separated field
+      final teamsRaw = (tournament[DatabaseHelper.colTeams] as String?) ?? '';
+      teamNames = teamsRaw
+          .split(',')
+          .map((t) => t.trim())
+          .where((t) => t.isNotEmpty)
+          .toList();
+    }
 
     // Accumulator map keyed by team name
     final Map<String, _TeamAcc> acc = {
@@ -188,19 +200,24 @@ class TournamentProvider extends ChangeNotifier {
       final inn1 = await db.getInningsSummary(matchId, 1);
       final inn2 = await db.getInningsSummary(matchId, 2);
 
-      final runsA = inn1['totalRuns'] ?? 0;
+      final runsA    = inn1['totalRuns']    ?? 0;
       final wicketsA = inn1['totalWickets'] ?? 0;
       final legalBallsA = inn1['legalBalls'] ?? 0;
 
-      final runsB = inn2['totalRuns'] ?? 0;
+      final runsB    = inn2['totalRuns']    ?? 0;
       final wicketsB = inn2['totalWickets'] ?? 0;
       final legalBallsB = inn2['legalBalls'] ?? 0;
 
-      // Convert legal balls to decimal overs for NRR.
-      // If a team was all-out, count only balls faced.
-      // If a team used all overs, the denominator is totalOversAllowed exactly.
-      final oversA = _legalBallsToOvers(legalBallsA, totalOversAllowed, wicketsA);
-      final oversB = _legalBallsToOvers(legalBallsB, totalOversAllowed, wicketsB);
+      // Squad size: use match's squad_size column to determine the all-out
+      // threshold (squad_size - 1 wickets = all out).
+      final squadSize = (match[DatabaseHelper.colSquadSize] as int?) ?? 11;
+      final wicketLimit = squadSize - 1;
+
+      // Convert legal balls to decimal overs per ICC rule:
+      //   • All-out (wickets == wicketLimit) → use MAX overs (full quota)
+      //   • Not all-out → use actual legal balls faced / bowled
+      final oversA = _legalBallsToOvers(legalBallsA, totalOversAllowed, wicketsA, wicketLimit);
+      final oversB = _legalBallsToOvers(legalBallsB, totalOversAllowed, wicketsB, wicketLimit);
 
       // Ensure both team accumulators exist (handles teams not in original list)
       acc.putIfAbsent(teamA, () => _TeamAcc(teamA));
@@ -304,20 +321,32 @@ class TournamentProvider extends ChangeNotifier {
 
   // ── NRR helpers ────────────────────────────────────────────────────────────
 
-  /// Convert a legal-ball count to decimal overs.
+  /// Convert a legal-ball count to decimal overs using ICC NRR rules.
   ///
-  /// If the team used all of [maxOvers] (i.e. completed the full allocation)
-  /// return [maxOvers] exactly.  If they were all-out before [maxOvers] their
-  /// actual ball count is used. [wickets] is used as all-out indicator (≥ 10).
-  static double _legalBallsToOvers(int legalBalls, int maxOvers, int wickets) {
-    if (wickets >= 10) {
-      // All out — use actual balls faced
-      final completeOvers = legalBalls ~/ 6;
-      final extra         = legalBalls % 6;
-      return completeOvers + extra / 6.0;
+  /// ICC rule:
+  ///   • If the team was **all-out** (wickets == [wicketLimit]) before their
+  ///     full allocation, the denominator MUST be set to [maxOvers] — as if
+  ///     they faced the full quota.
+  ///   • If the team was **not** all-out (batted out their overs normally),
+  ///     convert the actual legal balls to decimal overs:
+  ///     e.g., 20 balls = 3.2 overs (3 + 2/6 ≈ 3.333…).
+  ///
+  /// Fractional over math: a "2.3" display means 2 complete overs + 3 balls,
+  /// so as a decimal it is 2 + 3/6 = 2.5 (not 2.3).
+  static double _legalBallsToOvers(
+    int legalBalls,
+    int maxOvers,
+    int wickets,
+    int wicketLimit,
+  ) {
+    if (wickets >= wicketLimit) {
+      // All out — ICC rule: use the MAXIMUM scheduled overs as the denominator.
+      return maxOvers.toDouble();
     }
-    // Not all out — innings used the full allocation
-    return maxOvers.toDouble();
+    // Not all out — use actual balls faced/bowled converted to decimal overs.
+    final completeOvers = legalBalls ~/ 6;
+    final extraBalls    = legalBalls % 6;
+    return completeOvers + extraBalls / 6.0;
   }
 
   /// Net Run Rate = (runs scored / overs faced) − (runs conceded / overs bowled).

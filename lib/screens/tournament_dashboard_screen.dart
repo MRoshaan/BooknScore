@@ -121,6 +121,260 @@ class _TournamentDashboardScreenState extends State<TournamentDashboardScreen>
     if (mounted) _loadAll();
   }
 
+  /// Shows a bottom sheet that lists all teams in the DB, letting the user
+  /// pick one and insert it as a late-entry team into this tournament.
+  Future<void> _addTeamToTournament() async {
+    // Fetch every distinct team name from the players table.
+    final db = await DatabaseHelper.instance.database;
+    final rows = await db.rawQuery(
+      'SELECT DISTINCT ${DatabaseHelper.colTeam} FROM ${DatabaseHelper.tablePlayers} '
+      'ORDER BY ${DatabaseHelper.colTeam} ASC',
+    );
+    final allTeamNames = rows
+        .map((r) => r[DatabaseHelper.colTeam] as String)
+        .toList();
+
+    // Also include teams already registered in this tournament so the full
+    // list is available even if players haven't been entered yet.
+    final tournamentTeamRows =
+        await DatabaseHelper.instance.fetchAllTournamentTeamRows(widget.tournamentId);
+    final registeredNames =
+        tournamentTeamRows.map((r) => r[DatabaseHelper.colTeamName] as String).toSet();
+
+    // Merge: registered names first, then any extras from players table.
+    final merged = <String>{...registeredNames, ...allTeamNames}.toList()..sort();
+
+    if (!mounted) return;
+
+    String? selected;
+    final controller = TextEditingController();
+
+    await showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: _surfaceCard,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setModalState) {
+            final filtered = controller.text.trim().isEmpty
+                ? merged
+                : merged
+                    .where((n) => n
+                        .toLowerCase()
+                        .contains(controller.text.trim().toLowerCase()))
+                    .toList();
+
+            return Padding(
+              padding: EdgeInsets.only(
+                left: 20,
+                right: 20,
+                top: 20,
+                bottom: MediaQuery.of(ctx).viewInsets.bottom + 20,
+              ),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Row(
+                    children: [
+                      const Icon(Icons.group_add, color: _trophyGold, size: 20),
+                      const SizedBox(width: 8),
+                      Text(
+                        'Add Team to Tournament',
+                        style: GoogleFonts.rajdhani(
+                          fontSize: 18,
+                          fontWeight: FontWeight.w800,
+                          color: _textPrimary,
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    'Select an existing team to add as a late entry.',
+                    style: GoogleFonts.rajdhani(
+                        fontSize: 13, color: _textSecondary),
+                  ),
+                  const SizedBox(height: 14),
+                  // Search field inside the sheet
+                  TextField(
+                    controller: controller,
+                    style: GoogleFonts.rajdhani(
+                        fontSize: 14, color: _textPrimary),
+                    onChanged: (_) => setModalState(() {}),
+                    decoration: InputDecoration(
+                      hintText: 'Search team…',
+                      hintStyle: GoogleFonts.rajdhani(
+                          fontSize: 14, color: _textSecondary),
+                      prefixIcon: const Icon(Icons.search,
+                          color: _accentGreenMid, size: 18),
+                      filled: true,
+                      fillColor: _surfaceCard2,
+                      contentPadding: const EdgeInsets.symmetric(
+                          horizontal: 12, vertical: 10),
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(10),
+                        borderSide: BorderSide.none,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  if (filtered.isEmpty)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 20),
+                      child: Center(
+                        child: Text('No teams found.',
+                            style: GoogleFonts.rajdhani(
+                                fontSize: 14, color: _textSecondary)),
+                      ),
+                    )
+                  else
+                    ConstrainedBox(
+                      constraints: const BoxConstraints(maxHeight: 280),
+                      child: ListView.builder(
+                        shrinkWrap: true,
+                        itemCount: filtered.length,
+                        itemBuilder: (_, i) {
+                          final name = filtered[i];
+                          final isRegistered = registeredNames.contains(name);
+                          final isSelected = selected == name;
+                          return GestureDetector(
+                            onTap: () => setModalState(() => selected = name),
+                            child: Container(
+                              margin:
+                                  const EdgeInsets.symmetric(vertical: 3),
+                              padding: const EdgeInsets.symmetric(
+                                  horizontal: 14, vertical: 10),
+                              decoration: BoxDecoration(
+                                color: isSelected
+                                    ? _trophyGold.withAlpha(30)
+                                    : _surfaceCard2,
+                                borderRadius: BorderRadius.circular(10),
+                                border: Border.all(
+                                  color: isSelected
+                                      ? _trophyGold.withAlpha(120)
+                                      : const Color(0xFF2A2A2A),
+                                ),
+                              ),
+                              child: Row(
+                                children: [
+                                  Icon(
+                                    isSelected
+                                        ? Icons.check_circle
+                                        : Icons.group,
+                                    color: isSelected
+                                        ? _trophyGold
+                                        : _textSecondary,
+                                    size: 18,
+                                  ),
+                                  const SizedBox(width: 10),
+                                  Expanded(
+                                    child: Text(
+                                      name,
+                                      style: GoogleFonts.rajdhani(
+                                        fontSize: 15,
+                                        fontWeight: isSelected
+                                            ? FontWeight.w800
+                                            : FontWeight.w600,
+                                        color: isSelected
+                                            ? _trophyGold
+                                            : _textPrimary,
+                                      ),
+                                    ),
+                                  ),
+                                  if (isRegistered)
+                                    Container(
+                                      padding: const EdgeInsets.symmetric(
+                                          horizontal: 6, vertical: 2),
+                                      decoration: BoxDecoration(
+                                        color:
+                                            _accentGreenMid.withAlpha(25),
+                                        borderRadius:
+                                            BorderRadius.circular(4),
+                                      ),
+                                      child: Text(
+                                        'REGISTERED',
+                                        style: GoogleFonts.rajdhani(
+                                          fontSize: 9,
+                                          fontWeight: FontWeight.w700,
+                                          color: _accentGreenMid,
+                                          letterSpacing: 1,
+                                        ),
+                                      ),
+                                    ),
+                                ],
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                    ),
+                  const SizedBox(height: 14),
+                  SizedBox(
+                    width: double.infinity,
+                    height: 48,
+                    child: ElevatedButton.icon(
+                      onPressed: selected == null
+                          ? null
+                          : () => Navigator.pop(ctx, selected),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: _trophyGold,
+                        disabledBackgroundColor:
+                            _trophyGold.withAlpha(50),
+                        foregroundColor: Colors.black,
+                        shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(12)),
+                      ),
+                      icon: const Icon(Icons.add, size: 18),
+                      label: Text(
+                        'Add to Tournament',
+                        style: GoogleFonts.rajdhani(
+                            fontSize: 15, fontWeight: FontWeight.w800),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            );
+          },
+        );
+      },
+    ).then((picked) async {
+      if (picked == null || !mounted) return;
+      final teamName = picked as String;
+      // Skip if already registered.
+      if (registeredNames.contains(teamName)) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              '$teamName is already in this tournament.',
+              style: GoogleFonts.rajdhani(fontSize: 14),
+            ),
+            backgroundColor: _surfaceCard,
+          ),
+        );
+        return;
+      }
+      await DatabaseHelper.instance
+          .insertTeamIntoTournament(widget.tournamentId, teamName);
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              '$teamName added to the tournament.',
+              style: GoogleFonts.rajdhani(fontSize: 14),
+            ),
+            backgroundColor: _accentGreenMid,
+          ),
+        );
+        _loadAll();
+      }
+    });
+  }
+
   // ── Build ────────────────────────────────────────────────────────────────────
 
   @override
@@ -163,6 +417,7 @@ class _TournamentDashboardScreenState extends State<TournamentDashboardScreen>
                     matches: _matches,
                     onTapMatch: _openScoring,
                     onAddMatch: _addMatch,
+                    onAddTeam: _addTeamToTournament,
                     tournamentStatus: status,
                     tournament: t,
                   ),
@@ -262,6 +517,7 @@ class _MatchesTab extends StatelessWidget {
     required this.matches,
     required this.onTapMatch,
     required this.onAddMatch,
+    required this.onAddTeam,
     required this.tournamentStatus,
     required this.tournament,
   });
@@ -269,6 +525,7 @@ class _MatchesTab extends StatelessWidget {
   final List<Map<String, dynamic>> matches;
   final void Function(int matchId) onTapMatch;
   final VoidCallback onAddMatch;
+  final VoidCallback onAddTeam;
   final String tournamentStatus;
   final Map<String, dynamic> tournament;
 
@@ -326,6 +583,8 @@ class _MatchesTab extends StatelessWidget {
         // Add Match button — hidden when tournament is completed
         if (!isCompleted) ...[
           _AddMatchButton(onTap: onAddMatch),
+          const SizedBox(height: 10),
+          _AddTeamButton(onTap: onAddTeam),
           const SizedBox(height: 20),
         ],
 
@@ -454,6 +713,33 @@ class _AddMatchButton extends StatelessWidget {
           'Add Match',
           style: GoogleFonts.rajdhani(
               fontSize: 16, fontWeight: FontWeight.w800, letterSpacing: 1),
+        ),
+      ),
+    );
+  }
+}
+
+class _AddTeamButton extends StatelessWidget {
+  const _AddTeamButton({required this.onTap});
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      height: 46,
+      child: OutlinedButton.icon(
+        onPressed: onTap,
+        style: OutlinedButton.styleFrom(
+          foregroundColor: _trophyGold,
+          side: BorderSide(color: _trophyGold.withAlpha(140), width: 1.5),
+          shape:
+              RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        ),
+        icon: const Icon(Icons.group_add, size: 18),
+        label: Text(
+          'Add Late-Entry Team',
+          style: GoogleFonts.rajdhani(
+              fontSize: 15, fontWeight: FontWeight.w700, letterSpacing: 0.5),
         ),
       ),
     );

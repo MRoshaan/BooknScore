@@ -1115,6 +1115,24 @@ class DatabaseHelper {
     );
   }
 
+  /// Insert a late-entry team into [tournament_teams] for an ongoing tournament.
+  ///
+  /// Returns the new row id, or throws if the team already exists in this
+  /// tournament (use [ConflictAlgorithm.ignore] to silently skip duplicates).
+  Future<int> insertTeamIntoTournament(int tournamentId, String teamName) async {
+    final db = await database;
+    final id = await db.insert(
+      tableTournamentTeams,
+      {
+        colTournamentId: tournamentId,
+        colTeamName:     teamName.trim(),
+        colIsEliminated: 0,
+      },
+      conflictAlgorithm: ConflictAlgorithm.ignore,
+    );
+    return id;
+  }
+
   /// Mark a team as eliminated in [tournament_teams].
   ///
   /// [teamName] is matched case-sensitively (it should always come from the

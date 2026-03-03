@@ -800,7 +800,9 @@ class MatchProvider extends ChangeNotifier {
       // Use the same physical-runs logic as _recordBallEvent.
       final int runsForStrikeRotation;
       if (lastBall.extraType == 'no_ball') {
-        runsForStrikeRotation = lastBall.runsScored; // ignore NB penalty
+        // runsScored = off-bat batter runs; (extraRuns - 1) = additional physical
+        // runs beyond the mandatory NB penalty. Both are physical running.
+        runsForStrikeRotation = lastBall.runsScored + (lastBall.extraRuns - 1);
       } else if (lastBall.extraType == 'wide') {
         runsForStrikeRotation = lastBall.extraRuns - 1; // physical runs only
       } else {
@@ -1206,21 +1208,21 @@ class MatchProvider extends ChangeNotifier {
 
       // Calculate runs that physically count for strike rotation.
       //
-      // No Ball: the mandatory +1 penalty run (always in extraRuns) is awarded
-      //   to the batting side without the batters running — exclude it.
-      //   Only runsScored (off-bat runs) and any additional byes/legbyes
-      //   encoded in extraRuns beyond the NB penalty contribute.
-      //   Simplification: treat NB runs-for-rotation as runsScored only.
+      // No Ball: extraRuns = 1 (mandatory penalty) + any additional runs the
+      //   batters physically completed (whether scored as batter runs or extras).
+      //   The mandatory +1 is never a physical run, so subtract it.
+      //   runsScored = batter runs off the bat (also physical).
+      //   Physical runs = runsScored + (extraRuns - 1).
       //
-      // Wide: batters CAN physically run on a wide (e.g. Wide + 3).
-      //   The total extra_runs for a wide = 1 (penalty) + additional runs.
-      //   Physical runs taken = extraRuns - 1 (subtracting the penalty).
-      //   If that is odd, strike rotates.
+      // Wide: extraRuns = 1 (penalty) + additional runs batters physically ran.
+      //   Physical runs = extraRuns - 1.
       //
       // Bye / Leg Bye / normal: every run is a physical run; count all.
       final int runsForStrikeRotation;
       if (extraType == 'no_ball') {
-        runsForStrikeRotation = runsScored; // ignore the NB penalty in extraRuns
+        // runsScored holds off-bat runs; (extraRuns - 1) holds any additional
+        // physical runs (NB extras the batters ran). Both count for rotation.
+        runsForStrikeRotation = runsScored + (extraRuns - 1);
       } else if (extraType == 'wide') {
         // extraRuns includes 1 penalty + any additional run(s) batters actually ran
         runsForStrikeRotation = extraRuns - 1; // physical runs only
