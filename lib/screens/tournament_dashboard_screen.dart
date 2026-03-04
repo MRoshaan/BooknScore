@@ -9,6 +9,7 @@ import '../providers/tournament_provider.dart';
 import 'new_match_screen.dart';
 import 'scoring_screen.dart';
 import 'match_summary_screen.dart';
+import 'team_history_screen.dart';
 
 // ── Brand Palette ─────────────────────────────────────────────────────────────
 const Color _accentGreen    = Color(0xFF39FF14);
@@ -41,6 +42,7 @@ class _TournamentDashboardScreenState extends State<TournamentDashboardScreen>
   List<TeamStanding> _standings = [];
   bool _loadingMeta = true;
   bool _loadingStandings = false;
+  String? _resolvedWinnerName;
 
   @override
   void initState() {
@@ -70,10 +72,29 @@ class _TournamentDashboardScreenState extends State<TournamentDashboardScreen>
       final db = DatabaseHelper.instance;
       final t = await db.fetchTournament(widget.tournamentId);
       final m = await db.fetchMatchesByTournament(widget.tournamentId);
+
+      // Resolve the winner team name for the champions banner.
+      String? winnerName;
+      final winnerTeamId = t?[DatabaseHelper.colWinnerTeamId];
+      if (winnerTeamId != null) {
+        final rawDb = await db.database;
+        final rows = await rawDb.query(
+          DatabaseHelper.tableTournamentTeams,
+          columns: [DatabaseHelper.colTeamName],
+          where: '${DatabaseHelper.colId} = ?',
+          whereArgs: [winnerTeamId],
+          limit: 1,
+        );
+        if (rows.isNotEmpty) {
+          winnerName = rows.first[DatabaseHelper.colTeamName] as String?;
+        }
+      }
+
       if (mounted) {
         setState(() {
           _tournament = t;
           _matches = m;
+          _resolvedWinnerName = winnerName;
           _loadingMeta = false;
         });
       }
@@ -123,6 +144,8 @@ class _TournamentDashboardScreenState extends State<TournamentDashboardScreen>
 
   /// Shows a bottom sheet that lists all teams in the DB, letting the user
   /// pick one and insert it as a late-entry team into this tournament.
+  /// Also exposes a '+ Create New Team' button to create a brand-new team
+  /// and register it in the tournament in a single transaction.
   Future<void> _addTeamToTournament() async {
     // Fetch every distinct team name from the players table.
     final db = await DatabaseHelper.instance.database;
@@ -147,7 +170,152 @@ class _TournamentDashboardScreenState extends State<TournamentDashboardScreen>
     if (!mounted) return;
 
     String? selected;
-    final controller = TextEditingController();
+    final searchController = TextEditingController();
+
+    // ── Helper: open the "Create New Team" dialog ────────────────────────────
+    Future<void> showCreateTeamDialog(
+      BuildContext sheetCtx,
+      void Function(void Function()) setModalState,
+    ) async {
+      final newTeamController = TextEditingController();
+      String? dialogError;
+
+      await showDialog<void>(
+        context: sheetCtx,
+        barrierDismissible: false,
+        builder: (dialogCtx) {
+          return StatefulBuilder(
+            builder: (dialogCtx, setDialogState) {
+              return AlertDialog(
+                backgroundColor: _surfaceCard,
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(16)),
+                title: Row(
+                  children: [
+                    const Icon(Icons.add_circle_outline,
+                        color: _accentGreen, size: 20),
+                    const SizedBox(width: 8),
+                    Text(
+                      'Create New Team',
+                      style: GoogleFonts.rajdhani(
+                        fontSize: 17,
+                        fontWeight: FontWeight.w800,
+                        color: _textPrimary,
+                      ),
+                    ),
+                  ],
+                ),
+                content: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      'Enter a name for the new team. It will be created and '
+                      'immediately added to this tournament.',
+                      style: GoogleFonts.rajdhani(
+                          fontSize: 13, color: _textSecondary),
+                    ),
+                    const SizedBox(height: 14),
+                    TextField(
+                      controller: newTeamController,
+                      autofocus: true,
+                      textCapitalization: TextCapitalization.words,
+                      style: GoogleFonts.rajdhani(
+                          fontSize: 15, color: _textPrimary),
+                      onChanged: (_) {
+                        if (dialogError != null) {
+                          setDialogState(() => dialogError = null);
+                        }
+                      },
+                      decoration: InputDecoration(
+                        hintText: 'Team Name',
+                        hintStyle: GoogleFonts.rajdhani(
+                            fontSize: 14, color: _textSecondary),
+                        errorText: dialogError,
+                        errorStyle: GoogleFonts.rajdhani(
+                            fontSize: 12, color: _liveRed),
+                        prefixIcon: const Icon(Icons.group_add,
+                            color: _accentGreenMid, size: 18),
+                        filled: true,
+                        fillColor: _surfaceCard2,
+                        contentPadding: const EdgeInsets.symmetric(
+                            horizontal: 12, vertical: 12),
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(10),
+                          borderSide: BorderSide.none,
+                        ),
+                        focusedBorder: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(10),
+                          borderSide: const BorderSide(
+                              color: _accentGreen, width: 1.5),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(dialogCtx),
+                    child: Text(
+                      'Cancel',
+                      style: GoogleFonts.rajdhani(
+                          fontSize: 14, color: _textSecondary),
+                    ),
+                  ),
+                  ElevatedButton(
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: _accentGreen,
+                      foregroundColor: Colors.black,
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(10)),
+                    ),
+                    onPressed: () async {
+                      final name = newTeamController.text.trim();
+                      if (name.isEmpty) {
+                        setDialogState(
+                            () => dialogError = 'Team name cannot be empty.');
+                        return;
+                      }
+                      try {
+                        await DatabaseHelper.instance
+                            .createTeamAndAddToTournament(
+                                widget.tournamentId, name);
+                        // Close dialog, then close the bottom sheet.
+                        if (dialogCtx.mounted) Navigator.pop(dialogCtx);
+                        if (sheetCtx.mounted) Navigator.pop(sheetCtx);
+                        // Refresh dashboard and show success feedback.
+                        if (mounted) {
+                          _loadAll();
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text(
+                                '$name created and added to the tournament.',
+                                style: GoogleFonts.rajdhani(fontSize: 14),
+                              ),
+                              backgroundColor: _accentGreenMid,
+                            ),
+                          );
+                        }
+                      } on StateError catch (e) {
+                        setDialogState(() => dialogError = e.message);
+                      } catch (_) {
+                        setDialogState(() =>
+                            dialogError = 'Something went wrong. Try again.');
+                      }
+                    },
+                    child: Text(
+                      'Create & Add',
+                      style: GoogleFonts.rajdhani(
+                          fontSize: 14, fontWeight: FontWeight.w800),
+                    ),
+                  ),
+                ],
+              );
+            },
+          );
+        },
+      );
+    }
 
     await showModalBottomSheet(
       context: context,
@@ -159,12 +327,12 @@ class _TournamentDashboardScreenState extends State<TournamentDashboardScreen>
       builder: (ctx) {
         return StatefulBuilder(
           builder: (ctx, setModalState) {
-            final filtered = controller.text.trim().isEmpty
+            final filtered = searchController.text.trim().isEmpty
                 ? merged
                 : merged
                     .where((n) => n
                         .toLowerCase()
-                        .contains(controller.text.trim().toLowerCase()))
+                        .contains(searchController.text.trim().toLowerCase()))
                     .toList();
 
             return Padding(
@@ -194,14 +362,14 @@ class _TournamentDashboardScreenState extends State<TournamentDashboardScreen>
                   ),
                   const SizedBox(height: 4),
                   Text(
-                    'Select an existing team to add as a late entry.',
+                    'Select an existing team or create a new one.',
                     style: GoogleFonts.rajdhani(
                         fontSize: 13, color: _textSecondary),
                   ),
                   const SizedBox(height: 14),
                   // Search field inside the sheet
                   TextField(
-                    controller: controller,
+                    controller: searchController,
                     style: GoogleFonts.rajdhani(
                         fontSize: 14, color: _textPrimary),
                     onChanged: (_) => setModalState(() {}),
@@ -222,6 +390,32 @@ class _TournamentDashboardScreenState extends State<TournamentDashboardScreen>
                     ),
                   ),
                   const SizedBox(height: 10),
+                  // ── Create New Team button ──────────────────────────────
+                  SizedBox(
+                    width: double.infinity,
+                    child: OutlinedButton.icon(
+                      onPressed: () =>
+                          showCreateTeamDialog(ctx, setModalState),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: _accentGreen,
+                        side: const BorderSide(
+                            color: _accentGreen, width: 1.2),
+                        shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(10)),
+                        padding: const EdgeInsets.symmetric(vertical: 11),
+                      ),
+                      icon: const Icon(Icons.add, size: 16),
+                      label: Text(
+                        '+ Create New Team',
+                        style: GoogleFonts.rajdhani(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w700,
+                          letterSpacing: 0.4,
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 10),
                   if (filtered.isEmpty)
                     Padding(
                       padding: const EdgeInsets.symmetric(vertical: 20),
@@ -233,7 +427,7 @@ class _TournamentDashboardScreenState extends State<TournamentDashboardScreen>
                     )
                   else
                     ConstrainedBox(
-                      constraints: const BoxConstraints(maxHeight: 280),
+                      constraints: const BoxConstraints(maxHeight: 240),
                       child: ListView.builder(
                         shrinkWrap: true,
                         itemCount: filtered.length,
@@ -420,6 +614,7 @@ class _TournamentDashboardScreenState extends State<TournamentDashboardScreen>
                     onAddTeam: _addTeamToTournament,
                     tournamentStatus: status,
                     tournament: t,
+                    resolvedWinnerName: _resolvedWinnerName,
                   ),
                   _PointsTableTab(
                     standings: _standings,
@@ -520,6 +715,7 @@ class _MatchesTab extends StatelessWidget {
     required this.onAddTeam,
     required this.tournamentStatus,
     required this.tournament,
+    this.resolvedWinnerName,
   });
 
   final List<Map<String, dynamic>> matches;
@@ -528,35 +724,39 @@ class _MatchesTab extends StatelessWidget {
   final VoidCallback onAddTeam;
   final String tournamentStatus;
   final Map<String, dynamic> tournament;
+  final String? resolvedWinnerName;
 
   @override
   Widget build(BuildContext context) {
     final isCompleted = tournamentStatus == 'completed';
 
-    // Resolve winner name from tournament data for the champions banner.
-    // winner_team_id is set when the Final match is completed.
-    // As a fallback we inspect the matches for a 'Final' with a winner string.
-    String? winnerName;
-    final winnerTeamId = tournament[DatabaseHelper.colWinnerTeamId];
-    if (winnerTeamId == null) {
-      // Fallback: scan matches for a completed Final
-      final finalMatch = matches.firstWhere(
-        (m) =>
-            m[DatabaseHelper.colMatchStage] == 'Final' &&
-            m[DatabaseHelper.colStatus] == 'completed',
-        orElse: () => {},
-      );
-      if (finalMatch.isNotEmpty) {
-        final rawWinner = finalMatch[DatabaseHelper.colWinner] as String?;
-        if (rawWinner != null && rawWinner.isNotEmpty) {
-          // rawWinner is "TeamName won by X runs/wickets"
-          final teamA = finalMatch[DatabaseHelper.colTeamA] as String? ?? '';
-          final teamB = finalMatch[DatabaseHelper.colTeamB] as String? ?? '';
-          final lower = rawWinner.toLowerCase();
-          if (lower.contains(teamA.toLowerCase())) {
-            winnerName = teamA;
-          } else if (lower.contains(teamB.toLowerCase())) {
-            winnerName = teamB;
+    // Resolve winner name for the champions banner.
+    // Prefer the pre-resolved name passed from the parent state (looked up from
+    // tournament_teams by winner_team_id).  Fall back to scanning the matches
+    // list for a completed Final result string.
+    String? winnerName = resolvedWinnerName;
+    if (winnerName == null) {
+      final winnerTeamId = tournament[DatabaseHelper.colWinnerTeamId];
+      if (winnerTeamId == null) {
+        // Fallback: scan matches for a completed Final
+        final finalMatch = matches.firstWhere(
+          (m) =>
+              m[DatabaseHelper.colMatchStage] == 'Final' &&
+              m[DatabaseHelper.colStatus] == 'completed',
+          orElse: () => {},
+        );
+        if (finalMatch.isNotEmpty) {
+          final rawWinner = finalMatch[DatabaseHelper.colWinner] as String?;
+          if (rawWinner != null && rawWinner.isNotEmpty) {
+            // rawWinner is "TeamName won by X runs/wickets"
+            final teamA = finalMatch[DatabaseHelper.colTeamA] as String? ?? '';
+            final teamB = finalMatch[DatabaseHelper.colTeamB] as String? ?? '';
+            final lower = rawWinner.toLowerCase();
+            if (lower.contains(teamA.toLowerCase())) {
+              winnerName = teamA;
+            } else if (lower.contains(teamB.toLowerCase())) {
+              winnerName = teamB;
+            }
           }
         }
       }
@@ -1136,12 +1336,25 @@ class _StandingRow extends StatelessWidget {
                         fontSize: 13, color: _textSecondary, fontWeight: FontWeight.w700)),
           ),
           Expanded(
-            child: Text(standing.teamName,
+            child: InkWell(
+              borderRadius: BorderRadius.circular(4),
+              onTap: () => Navigator.push(
+                context,
+                MaterialPageRoute(
+                  builder: (_) => TeamHistoryScreen(teamName: standing.teamName),
+                ),
+              ),
+              child: Text(
+                standing.teamName,
                 style: GoogleFonts.rajdhani(
                     fontSize: 14,
                     fontWeight: isLeader ? FontWeight.w800 : FontWeight.w600,
-                    color: isLeader ? _trophyGold : _textPrimary),
-                overflow: TextOverflow.ellipsis),
+                    color: isLeader ? _trophyGold : _accentGreenMid,
+                    decoration: TextDecoration.underline,
+                    decorationColor: isLeader ? _trophyGold.withAlpha(80) : _accentGreenMid.withAlpha(80)),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
           ),
           _DataCell('${standing.played}'),
           _DataCell('${standing.won}', color: standing.won > 0 ? _accentGreenMid : null),

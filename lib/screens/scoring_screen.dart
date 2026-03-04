@@ -449,6 +449,21 @@ class _ScoringScreenState extends State<ScoringScreen> {
         ],
       ),
       actions: [
+        // View Scorecard
+        IconButton(
+          icon: const Icon(Icons.table_chart, size: 22),
+          onPressed: () => Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder: (_) => ScorecardScreen(
+                matchId: provider.matchId!,
+                teamA: provider.teamA,
+                teamB: provider.teamB,
+              ),
+            ),
+          ),
+          tooltip: 'View Scorecard',
+        ),
         // Swap strike manually
         IconButton(
           icon: const Icon(Icons.swap_horiz, size: 22),
@@ -1150,7 +1165,7 @@ class _ScoreboardPanel extends StatelessWidget {
               const SizedBox(height: 12),
 
               // ── Active Batters (Glassmorphism Card) ─────────────────────
-              _buildBattersCard(),
+              _buildBattersCard(context),
               const SizedBox(height: 10),
 
               // ── Current Bowler ──────────────────────────────────────────
@@ -1171,7 +1186,7 @@ class _ScoreboardPanel extends StatelessWidget {
     );
   }
 
-  Widget _buildBattersCard() {
+  Widget _buildBattersCard(BuildContext context) {
     return ClipRRect(
       borderRadius: BorderRadius.circular(14),
       child: BackdropFilter(
@@ -1192,7 +1207,7 @@ class _ScoreboardPanel extends StatelessWidget {
           ),
           child: Column(
             children: [
-              // Header
+              // Header row with Retire/Declare action
               Row(
                 children: [
                   Icon(Icons.sports_cricket, color: _accentGreen, size: 14),
@@ -1204,6 +1219,35 @@ class _ScoreboardPanel extends StatelessWidget {
                       fontWeight: FontWeight.w700,
                       color: _textSecondary,
                       letterSpacing: 2,
+                    ),
+                  ),
+                  const Spacer(),
+                  // Retire / Declare button
+                  GestureDetector(
+                    onTap: () => _showRetireDeclareDialog(context),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                      decoration: BoxDecoration(
+                        color: _wicketRed.withAlpha(20),
+                        borderRadius: BorderRadius.circular(6),
+                        border: Border.all(color: _wicketRed.withAlpha(80), width: 1),
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(Icons.logout, color: _wicketRed, size: 12),
+                          const SizedBox(width: 4),
+                          Text(
+                            'RETIRE / DECLARE',
+                            style: GoogleFonts.rajdhani(
+                              fontSize: 9,
+                              fontWeight: FontWeight.w700,
+                              color: _wicketRed,
+                              letterSpacing: 1,
+                            ),
+                          ),
+                        ],
+                      ),
                     ),
                   ),
                 ],
@@ -1229,6 +1273,76 @@ class _ScoreboardPanel extends StatelessWidget {
             ],
           ),
         ),
+      ),
+    );
+  }
+
+  void _showRetireDeclareDialog(BuildContext context) {
+    showDialog<void>(
+      context: context,
+      builder: (dCtx) => AlertDialog(
+        backgroundColor: _surfaceCard,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Row(
+          children: [
+            Icon(Icons.logout, color: _wicketRed, size: 20),
+            const SizedBox(width: 10),
+            Text(
+              'Retire / Declare',
+              style: GoogleFonts.rajdhani(
+                fontSize: 20,
+                fontWeight: FontWeight.w700,
+                color: _textPrimary,
+              ),
+            ),
+          ],
+        ),
+        content: Text(
+          'Choose an action for the current striker:',
+          style: GoogleFonts.rajdhani(
+            fontSize: 15,
+            color: _textSecondary,
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dCtx),
+            child: Text(
+              'Cancel',
+              style: GoogleFonts.rajdhani(color: _textSecondary, fontWeight: FontWeight.w600),
+            ),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              Navigator.pop(dCtx);
+              provider.recordWicket(wicketType: 'retired_hurt');
+            },
+            style: ElevatedButton.styleFrom(
+              backgroundColor: _extrasAmber,
+              foregroundColor: Colors.black,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+            ),
+            child: Text(
+              'Retire Hurt',
+              style: GoogleFonts.rajdhani(fontWeight: FontWeight.w700),
+            ),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              Navigator.pop(dCtx);
+              provider.endInnings();
+            },
+            style: ElevatedButton.styleFrom(
+              backgroundColor: _wicketRed,
+              foregroundColor: Colors.white,
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+            ),
+            child: Text(
+              'Declare Innings',
+              style: GoogleFonts.rajdhani(fontWeight: FontWeight.w700),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -1739,32 +1853,33 @@ class _ScoringPanelState extends State<_ScoringPanel> {
                   ),
                   const Spacer(),
                   
-                  // Extras toggle
-                  GestureDetector(
-                    onTap: () => setState(() => _showExtras = !_showExtras),
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                      decoration: BoxDecoration(
-                        color: _showExtras
-                            ? _extrasAmber.withAlpha(40)
-                            : _glassBg,
+                  // Extras toggle — prominent ElevatedButton
+                  ElevatedButton.icon(
+                    onPressed: () => setState(() => _showExtras = !_showExtras),
+                    icon: Icon(
+                      _showExtras ? Icons.sports_cricket : Icons.add_circle_outline,
+                      size: 16,
+                    ),
+                    label: Text(
+                      _showExtras ? 'RUNS' : 'EXTRAS',
+                      style: GoogleFonts.rajdhani(
+                        fontSize: 11,
+                        fontWeight: FontWeight.w800,
+                        letterSpacing: 1,
+                      ),
+                    ),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: _showExtras
+                          ? _extrasAmber.withAlpha(180)
+                          : _extrasAmber,
+                      foregroundColor: Colors.black,
+                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                      minimumSize: Size.zero,
+                      tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      shape: RoundedRectangleBorder(
                         borderRadius: BorderRadius.circular(8),
-                        border: Border.all(
-                          color: _showExtras
-                              ? _extrasAmber.withAlpha(100)
-                              : _glassBorder,
-                          width: 1,
-                        ),
                       ),
-                      child: Text(
-                        _showExtras ? 'RUNS' : 'EXTRAS',
-                        style: GoogleFonts.rajdhani(
-                          fontSize: 10,
-                          fontWeight: FontWeight.w700,
-                          color: _showExtras ? _extrasAmber : _textSecondary,
-                          letterSpacing: 1,
-                        ),
-                      ),
+                      elevation: _showExtras ? 0 : 4,
                     ),
                   ),
                 ],

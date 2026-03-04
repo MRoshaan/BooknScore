@@ -3,6 +3,7 @@ import 'package:google_fonts/google_fonts.dart';
 
 import '../services/database_helper.dart';
 import 'player_profile_screen.dart';
+import 'team_history_screen.dart';
 
 // ── Brand Palette ─────────────────────────────────────────────────────────────
 const Color _accentGreen   = Color(0xFF4CAF50);
@@ -628,13 +629,23 @@ class _ScorecardScreenState extends State<ScorecardScreen>
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(
-                  team.toUpperCase(),
-                  style: GoogleFonts.rajdhani(
-                    fontSize: 13,
-                    fontWeight: FontWeight.w700,
-                    color: color,
-                    letterSpacing: 2,
+                GestureDetector(
+                  onTap: () => Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (_) => TeamHistoryScreen(teamName: team),
+                    ),
+                  ),
+                  child: Text(
+                    team.toUpperCase(),
+                    style: GoogleFonts.rajdhani(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w700,
+                      color: color,
+                      letterSpacing: 2,
+                      decoration: TextDecoration.underline,
+                      decorationColor: color.withAlpha(80),
+                    ),
                   ),
                 ),
                 const SizedBox(height: 2),

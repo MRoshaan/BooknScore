@@ -237,6 +237,17 @@ class DatabaseHelper {
     );
   }
 
+  /// Return all matches where [teamName] is either team_a or team_b, newest first.
+  Future<List<Map<String, dynamic>>> fetchMatchesByTeam(String teamName) async {
+    final db = await database;
+    return db.query(
+      tableMatches,
+      where: '$colTeamA = ? OR $colTeamB = ?',
+      whereArgs: [teamName, teamName],
+      orderBy: '$colCreatedAt DESC',
+    );
+  }
+
   /// Fetch a single match by id.
   Future<Map<String, dynamic>?> fetchMatch(int matchId) async {
     final db = await database;
@@ -1113,6 +1124,70 @@ class DatabaseHelper {
       whereArgs: [tournamentId],
       orderBy: '$colTeamName ASC',
     );
+  }
+
+  /// Creates a brand-new team and immediately registers it in the given
+  /// tournament, all within a single SQLite transaction.
+  ///
+  /// The new team is inserted into [tournament_teams] with [teamName].  The
+  /// same name is stored in the legacy comma-separated [teams] column on the
+  /// [tournaments] row so that existing code that reads the CSV column stays
+  /// consistent.
+  ///
+  /// Returns the new [tournament_teams] row id.
+  /// Throws a [StateError] if [teamName] (trimmed) is already registered in
+  /// this tournament.
+  Future<int> createTeamAndAddToTournament(
+    int tournamentId,
+    String teamName,
+  ) async {
+    final db = await database;
+    final trimmed = teamName.trim();
+
+    return db.transaction<int>((txn) async {
+      // Guard: reject if already registered.
+      final existing = await txn.query(
+        tableTournamentTeams,
+        columns: [colId],
+        where: '$colTournamentId = ? AND $colTeamName = ?',
+        whereArgs: [tournamentId, trimmed],
+        limit: 1,
+      );
+      if (existing.isNotEmpty) {
+        throw StateError('"$trimmed" is already registered in this tournament.');
+      }
+
+      // 1) Insert into tournament_teams and capture the new row id.
+      final teamRowId = await txn.insert(
+        tableTournamentTeams,
+        {
+          colTournamentId: tournamentId,
+          colTeamName:     trimmed,
+          colIsEliminated: 0,
+        },
+      );
+
+      // 2) Keep the legacy CSV `teams` column on the tournaments row in sync.
+      final tournamentRows = await txn.query(
+        tableTournaments,
+        columns: [colTeams],
+        where: '$colId = ?',
+        whereArgs: [tournamentId],
+        limit: 1,
+      );
+      if (tournamentRows.isNotEmpty) {
+        final csv = (tournamentRows.first[colTeams] as String? ?? '').trim();
+        final updated = csv.isEmpty ? trimmed : '$csv,$trimmed';
+        await txn.update(
+          tableTournaments,
+          {colTeams: updated},
+          where: '$colId = ?',
+          whereArgs: [tournamentId],
+        );
+      }
+
+      return teamRowId;
+    });
   }
 
   /// Insert a late-entry team into [tournament_teams] for an ongoing tournament.

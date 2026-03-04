@@ -7,6 +7,7 @@ import 'package:provider/provider.dart';
 import '../services/database_helper.dart';
 import '../services/sync_service.dart';
 import '../services/auth_service.dart';
+import 'scorecard_screen.dart';
 import '../providers/match_provider.dart';
 import '../providers/tournament_provider.dart';
 import 'new_match_screen.dart';
@@ -255,12 +256,38 @@ class _QuickMatchTabState extends State<_QuickMatchTab> {
     }
   }
 
-  void _openScoring(int matchId) {
-    context.read<MatchProvider>().loadMatch(matchId);
-    Navigator.push(
-      context,
-      MaterialPageRoute(builder: (_) => ScoringScreen(matchId: matchId)),
-    ).then((_) { if (mounted) _loadMatches(); });
+  void _openMatch(Map<String, dynamic> match) {
+    final id      = match[DatabaseHelper.colId]        as int;
+    final teamA   = match[DatabaseHelper.colTeamA]     as String;
+    final teamB   = match[DatabaseHelper.colTeamB]     as String;
+    final status  = match[DatabaseHelper.colStatus]    as String;
+    final creator = match[DatabaseHelper.colCreatedBy] as String?;
+    final userId  = AuthService.instance.userId;
+
+    // Completed matches always go to ScorecardScreen (read-only).
+    // Live/pending matches: creator routes to ScoringScreen, others to ScorecardScreen.
+    if (status == 'completed') {
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => ScorecardScreen(matchId: id, teamA: teamA, teamB: teamB),
+        ),
+      ).then((_) { if (mounted) _loadMatches(); });
+    } else if (creator != null && creator == userId) {
+      context.read<MatchProvider>().loadMatch(id);
+      Navigator.push(
+        context,
+        MaterialPageRoute(builder: (_) => ScoringScreen(matchId: id)),
+      ).then((_) { if (mounted) _loadMatches(); });
+    } else {
+      // Non-creator tapping a live/pending match → read-only scorecard.
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => ScorecardScreen(matchId: id, teamA: teamA, teamB: teamB),
+        ),
+      ).then((_) { if (mounted) _loadMatches(); });
+    }
   }
 
   Future<void> _syncNow() async {
@@ -433,13 +460,13 @@ class _QuickMatchTabState extends State<_QuickMatchTab> {
     return SliverList(
       delegate: SliverChildListDelegate([
         if (live.isNotEmpty) ...[
-          _sectionHeader('ACTIVE', _liveRed),
+          _sectionHeader('LIVE MATCHES', _liveRed),
           const SizedBox(height: 10),
           ...live.map((m) => _matchCard(m)),
           const SizedBox(height: 20),
         ],
         if (done.isNotEmpty) ...[
-          _sectionHeader('COMPLETED', _completedBlue),
+          _sectionHeader('RECENT MATCHES', _completedBlue),
           const SizedBox(height: 10),
           ...done.map((m) => _matchCard(m)),
         ],
@@ -507,7 +534,7 @@ class _QuickMatchTabState extends State<_QuickMatchTab> {
     return Padding(
       padding: const EdgeInsets.only(bottom: 10),
       child: GestureDetector(
-        onTap: () => _openScoring(id),
+        onTap: () => _openMatch(match),
         child: _PremiumCard(
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
