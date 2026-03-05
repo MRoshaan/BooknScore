@@ -81,6 +81,10 @@ class MatchProvider extends ChangeNotifier {
   // ── Batting lineup tracking ───────────────────────────────────────────────
   int _nextBatterNumber = 3; // After opening pair (for unnamed fallback)
 
+  // ── Live Commentary ───────────────────────────────────────────────────────
+  // Newest entry is at index 0 (reverse chronological order).
+  List<String> _commentary = [];
+
   // ══════════════════════════════════════════════════════════════════════════
   // GETTERS
   // ══════════════════════════════════════════════════════════════════════════
@@ -197,6 +201,9 @@ class MatchProvider extends ChangeNotifier {
   // Current over display
   List<BallEvent> get currentOverBalls => List.unmodifiable(_currentOverBalls);
   List<BallEvent> get allBallsThisInnings => List.unmodifiable(_allBallsThisInnings);
+
+  /// Live commentary feed — newest entry first.
+  List<String> get commentary => List.unmodifiable(_commentary);
   
   // UI State triggers
   bool get needsOpeningPlayers => _needsOpeningPlayers;
@@ -613,8 +620,13 @@ class MatchProvider extends ChangeNotifier {
       _currentBowlerId = bowlerId;
       _bowlerName = bowlerName;
       _needsNewBowler = false;
-      _bowlerStats = {'overs': 0, 'balls': 0, 'maidens': 0, 'runs': 0, 'wickets': 0, 'economy': 0.0};
-      
+
+      // Recalculate cumulative stats for this bowler from all previous
+      // deliveries they have bowled in this innings.  This correctly handles
+      // a bowler returning for a non-consecutive over (their figures must NOT
+      // reset to 0–0–0–0 on return).
+      await _recalculateBowlerStats();
+
       notifyListeners();
     } catch (e, st) {
       developer.log(
@@ -1149,6 +1161,7 @@ class MatchProvider extends ChangeNotifier {
     _matchResult = null;
     _nextBatterNumber = 3;
     _caughtNotLastBallOfOver = false;
+    _commentary = [];
     _isLoading = false;
     _isProcessing = false;
     _error = null;
@@ -1264,7 +1277,45 @@ class MatchProvider extends ChangeNotifier {
       // If both shouldRotate AND overComplete, they cancel out
 
       await _refreshInningsState();
-      
+
+      // ── Generate commentary string ───────────────────────────────────────
+      // Format: "{prev_over}.{ball} {bowler} to {striker}, {outcome}"
+      // overNum / ballNum were captured before the DB insert above.
+      {
+        final String outcome;
+        if (isWicket) {
+          final type = wicketType ?? 'Out';
+          final typeFmt = type
+              .replaceAll('_', ' ')
+              .split(' ')
+              .map((w) => w.isEmpty ? w : '${w[0].toUpperCase()}${w.substring(1)}')
+              .join(' ');
+          outcome = 'OUT! ($typeFmt)';
+        } else if (isBoundary && runsScored == 6) {
+          outcome = 'SIX!';
+        } else if (isBoundary && runsScored == 4) {
+          outcome = 'FOUR!';
+        } else if (extraType == 'wide') {
+          outcome = 'Wide';
+        } else if (extraType == 'no_ball') {
+          final extra = runsScored > 0 ? ', $runsScored runs' : '';
+          outcome = 'No Ball$extra';
+        } else if (extraType == 'bye') {
+          outcome = '${extraRuns == 1 ? '1 bye' : '$extraRuns byes'}';
+        } else if (extraType == 'leg_bye') {
+          outcome = '${extraRuns == 1 ? '1 leg bye' : '$extraRuns leg byes'}';
+        } else if (runsScored == 0) {
+          outcome = 'dot ball';
+        } else {
+          outcome = '$runsScored ${runsScored == 1 ? 'run' : 'runs'}';
+        }
+
+        // overNum - 1 because overNum is 1-based and we display zero-based.
+        final overLabel = '${overNum - 1}.$ballNum';
+        final entry = '$overLabel  $_bowlerName to $_strikerName, $outcome';
+        _commentary.insert(0, entry);
+      }
+
       // ── Handle post-ball events ──────────────────────────────────────────
       
       // Wicket: need new batter (unless all out)

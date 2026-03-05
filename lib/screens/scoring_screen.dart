@@ -200,6 +200,13 @@ class _ScoringScreenState extends State<ScoringScreen> {
               // ── Divider ─────────────────────────────────────────────────
               const _Divider(),
 
+              // ── Commentary Feed ──────────────────────────────────────────
+              Selector<MatchProvider, List<String>>(
+                selector: (_, p) => p.commentary,
+                shouldRebuild: (prev, next) => prev.length != next.length,
+                builder: (ctx, feed, _) => _CommentaryFeed(entries: feed),
+              ),
+
               // ── Bottom: Scoring Panel — targeted Selector rebuild ───────
               Expanded(
                 flex: 5,
@@ -1037,6 +1044,62 @@ class _Divider extends StatelessWidget {
   @override
   Widget build(BuildContext context) =>
       const ColoredBox(color: _borderSubtle, child: SizedBox(height: 1, width: double.infinity));
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// COMMENTARY FEED
+// ══════════════════════════════════════════════════════════════════════════════
+
+class _CommentaryFeed extends StatelessWidget {
+  const _CommentaryFeed({required this.entries});
+
+  final List<String> entries;
+
+  @override
+  Widget build(BuildContext context) {
+    if (entries.isEmpty) return const SizedBox.shrink();
+
+    return Container(
+      height: 72,
+      color: const Color(0xFF0D0D0D),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
+      child: ListView.builder(
+        reverse: false,
+        itemCount: entries.length > 5 ? 5 : entries.length,
+        itemBuilder: (_, i) {
+          final text = entries[i];
+          // Highlight special events in different colours
+          final isWicket = text.contains('OUT!');
+          final isSix    = text.contains('SIX!');
+          final isFour   = text.contains('FOUR!');
+
+          final Color textColor = isWicket
+              ? _wicketRed
+              : isSix
+                  ? _strikerGold
+                  : isFour
+                      ? _accentGreen
+                      : _textSecondary;
+
+          return Padding(
+            padding: const EdgeInsets.symmetric(vertical: 1),
+            child: Text(
+              text,
+              style: GoogleFonts.robotoMono(
+                fontSize: 11,
+                color: textColor,
+                fontWeight: (isWicket || isSix || isFour)
+                    ? FontWeight.w700
+                    : FontWeight.w400,
+              ),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+          );
+        },
+      ),
+    );
+  }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -3082,6 +3145,7 @@ class _NewBatterModalState extends State<_NewBatterModal> {
   late final TextEditingController _controller;
   final _formKey = GlobalKey<FormState>();
   List<String> _suggestions = [];
+  Set<String> _dismissedNames = {};
 
   @override
   void initState() {
@@ -3093,9 +3157,38 @@ class _NewBatterModalState extends State<_NewBatterModal> {
   Future<void> _loadSuggestions() async {
     final provider = context.read<MatchProvider>();
     final players = await DatabaseHelper.instance.fetchPlayersByTeam(provider.battingTeam);
+
+    // Fetch dismissed player IDs for this innings so we can exclude them.
+    Set<int> dismissedIds = {};
+    if (provider.matchId != null) {
+      dismissedIds = await DatabaseHelper.instance.fetchDismissedPlayerIds(
+        provider.matchId!,
+        provider.currentInnings,
+      );
+    }
+
+    // Also exclude currently active batters (striker & non-striker).
+    final activeIds = <int>{
+      if (provider.strikerId != null) provider.strikerId!,
+      if (provider.nonStrikerId != null) provider.nonStrikerId!,
+    };
+
+    // Build dismissed name set for validator (case-insensitive comparison).
+    final dismissed = players
+        .where((p) => dismissedIds.contains(p[DatabaseHelper.colId] as int))
+        .map((p) => (p[DatabaseHelper.colName] as String).toLowerCase())
+        .toSet();
+
     if (!mounted) return;
     setState(() {
-      _suggestions = players.map((p) => p[DatabaseHelper.colName] as String).toList();
+      _dismissedNames = dismissed;
+      _suggestions = players
+          .where((p) {
+            final id = p[DatabaseHelper.colId] as int;
+            return !activeIds.contains(id) && !dismissedIds.contains(id);
+          })
+          .map((p) => p[DatabaseHelper.colName] as String)
+          .toList();
     });
   }
 
@@ -3241,7 +3334,14 @@ class _NewBatterModalState extends State<_NewBatterModal> {
                         color: _textPrimary,
                       ),
                       decoration: _batterInputDecoration(),
-                      validator: (v) => v?.trim().isEmpty == true ? 'Enter batter name' : null,
+                      validator: (v) {
+                        final name = v?.trim() ?? '';
+                        if (name.isEmpty) return 'Enter batter name';
+                        if (_dismissedNames.contains(name.toLowerCase())) {
+                          return 'This player has already been dismissed';
+                        }
+                        return null;
+                      },
                       textCapitalization: TextCapitalization.words,
                       onFieldSubmitted: (_) => _handleSubmit(),
                     )
@@ -3263,7 +3363,14 @@ class _NewBatterModalState extends State<_NewBatterModal> {
                           autofocus: true,
                           style: GoogleFonts.rajdhani(fontSize: 18, fontWeight: FontWeight.w700, color: _textPrimary),
                           decoration: _batterInputDecoration(),
-                          validator: (_) => _controller.text.trim().isEmpty ? 'Enter batter name' : null,
+                          validator: (_) {
+                            final name = _controller.text.trim();
+                            if (name.isEmpty) return 'Enter batter name';
+                            if (_dismissedNames.contains(name.toLowerCase())) {
+                              return 'This player has already been dismissed';
+                            }
+                            return null;
+                          },
                           textCapitalization: TextCapitalization.words,
                           onFieldSubmitted: (_) { onSubmitted(); _handleSubmit(); },
                         );

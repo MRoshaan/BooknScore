@@ -446,6 +446,22 @@ class DatabaseHelper {
     );
   }
 
+  /// Returns the set of player IDs that have been dismissed (is_wicket = 1)
+  /// in the given innings of the given match.  Used by the new-batter modal to
+  /// prevent re-selecting an already out player.
+  Future<Set<int>> fetchDismissedPlayerIds(int matchId, int innings) async {
+    final db = await database;
+    final rows = await db.query(
+      tableBallEvents,
+      columns: [colOutPlayerId],
+      where: '$colMatchId = ? AND $colInnings = ? AND $colIsWicket = 1 AND $colOutPlayerId IS NOT NULL',
+      whereArgs: [matchId, innings],
+    );
+    return rows
+        .map((r) => r[colOutPlayerId] as int)
+        .toSet();
+  }
+
   /// Mark a ball event as synced.
   Future<void> markBallEventSynced(int eventId) async {
     final db = await database;

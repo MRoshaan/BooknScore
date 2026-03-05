@@ -953,8 +953,7 @@ class SyncService extends ChangeNotifier {
       try {
         final remoteMatches = await _supabase
             .from('matches')
-            .select()
-            .eq('created_by', userId);
+            .select();
         int matchesInserted = 0;
         await db.transaction((txn) async {
           for (final m in remoteMatches as List<dynamic>) {
