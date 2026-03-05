@@ -2887,7 +2887,15 @@ class _InitialPlayersDialogState extends State<_InitialPlayersDialog> {
                 hint: 'Opening batter (striker)',
                 icon: Icons.sports_cricket,
                 iconColor: _strikerGold,
-                validator: (v) => v?.trim().isEmpty == true ? 'Enter striker name' : null,
+                validator: (v) {
+                  final val = v?.trim() ?? '';
+                  if (val.isEmpty) return 'Enter striker name';
+                  final other = _nonStrikerController.text.trim();
+                  if (other.isNotEmpty && val.toLowerCase() == other.toLowerCase()) {
+                    return 'Striker and non-striker cannot be the same player';
+                  }
+                  return null;
+                },
               ),
               const SizedBox(height: 16),
               _buildAutocomplete(
@@ -2897,7 +2905,15 @@ class _InitialPlayersDialogState extends State<_InitialPlayersDialog> {
                 hint: 'Opening batter (non-striker)',
                 icon: Icons.sports_cricket,
                 iconColor: _accentGreen,
-                validator: (v) => v?.trim().isEmpty == true ? 'Enter non-striker name' : null,
+                validator: (v) {
+                  final val = v?.trim() ?? '';
+                  if (val.isEmpty) return 'Enter non-striker name';
+                  final other = _strikerController.text.trim();
+                  if (other.isNotEmpty && val.toLowerCase() == other.toLowerCase()) {
+                    return 'Cannot be the same as striker';
+                  }
+                  return null;
+                },
               ),
               const SizedBox(height: 16),
               _buildAutocomplete(
@@ -3340,6 +3356,10 @@ class _NewBatterModalState extends State<_NewBatterModal> {
                         if (_dismissedNames.contains(name.toLowerCase())) {
                           return 'This player has already been dismissed';
                         }
+                        final nonStriker = context.read<MatchProvider>().nonStrikerName.trim();
+                        if (name.toLowerCase() == nonStriker.toLowerCase()) {
+                          return 'New batter cannot be the current non-striker';
+                        }
                         return null;
                       },
                       textCapitalization: TextCapitalization.words,
@@ -3368,6 +3388,10 @@ class _NewBatterModalState extends State<_NewBatterModal> {
                             if (name.isEmpty) return 'Enter batter name';
                             if (_dismissedNames.contains(name.toLowerCase())) {
                               return 'This player has already been dismissed';
+                            }
+                            final nonStriker = context.read<MatchProvider>().nonStrikerName.trim();
+                            if (name.toLowerCase() == nonStriker.toLowerCase()) {
+                              return 'New batter cannot be the current non-striker';
                             }
                             return null;
                           },

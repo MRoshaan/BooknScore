@@ -697,8 +697,12 @@ class SyncService extends ChangeNotifier {
             'over_number':    event[DatabaseHelper.colOverNum],
             'ball_number':    event[DatabaseHelper.colBallNum],
             'runs_scored':    runsScored,
-            'batter_runs':    runsScored - extraRuns,
-            'is_wicket':      event[DatabaseHelper.colIsWicket] == 1,
+            // batter_runs = runs credited to the batter (off-bat only).
+            // Do NOT subtract extraRuns — that yields negative values for
+            // wides/no-balls where runsScored == 0 and extraRuns == 1.
+            'batter_runs':    runsScored,
+            'is_wicket':      (event[DatabaseHelper.colIsWicket]   as int? ?? 0) == 1,
+            'is_boundary':    (event[DatabaseHelper.colIsBoundary] as int? ?? 0) == 1,
             'dismissal_type': event[DatabaseHelper.colWicketType],
             'extra_type':     event[DatabaseHelper.colExtraType],
             'extra_runs':     extraRuns,
@@ -706,13 +710,17 @@ class SyncService extends ChangeNotifier {
             'non_striker':    playerUuid(event[DatabaseHelper.colNonStrikerId] as int?),
             'bowler':         playerUuid(event[DatabaseHelper.colBowlerId] as int?),
             'player_out':     playerUuid(event[DatabaseHelper.colOutPlayerId] as int?),
+            'created_by':     event[DatabaseHelper.colCreatedBy],
             'outcome':        null,
-            'crossed':        null,
+            'crossed':        false,
           };
         }).toList();
 
         try {
-          await _supabase.from('ball_events').upsert(payloads, ignoreDuplicates: true);
+          await _supabase.from('ball_events').upsert(
+            payloads,
+            ignoreDuplicates: false,
+          );
           for (final event in chunk) {
             syncedIds.add(event[DatabaseHelper.colId] as int);
           }
@@ -721,7 +729,7 @@ class SyncService extends ChangeNotifier {
             name: 'SyncService',
           );
         } on PostgrestException catch (e, st) {
-          print('SYNC ERROR (ball_events upsert chunk ${i ~/ chunkSize + 1}): $e | details: ${e.details} | hint: ${e.hint} | code: ${e.code}');
+          debugPrint('SUPABASE SYNC ERROR: ${e.message} - Details: ${e.details} - Hint: ${e.hint} - Code: ${e.code}');
           developer.log(
             'Batch upsert failed for ball_events chunk ${i ~/ chunkSize + 1}',
             name: 'SyncService',
