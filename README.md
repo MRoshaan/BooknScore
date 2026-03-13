@@ -22,10 +22,16 @@
 
 BooknScore utilizes a highly resilient **2-Tier Architecture**. The app interacts directly with the local SQLite database for instantaneous UI updates and offline reliability. A background `SyncService` listens for connectivity and securely syncs the local state with the Supabase PostgreSQL database using Row Level Security (RLS) policies.
 
-## 🚀 Getting Started
+## 📱 Download & Test the App
 
+Want to try BooknScore on your Android device right now without compiling the code? 
+
+📥 [**Download the latest APK here**](https://github.com/MRoshaan/BooknScore/releases/latest)
+
+*(Note: Your phone may ask you to "Allow installation from unknown sources" since the app is downloaded from GitHub instead of the Google Play Store. This is completely safe and standard for beta testing!)*
 To run this project locally:
 
+## 🚀 Getting Started
 1. Clone the repository:
    ```bash
    git clone [https://github.com/MRoshaan/BooknScore.git](https://github.com/YOUR_USERNAME/BooknScore.git)
