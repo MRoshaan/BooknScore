@@ -21,6 +21,11 @@
 ## 🏗️ Architecture
 
 BooknScore utilizes a highly resilient **2-Tier Architecture**. The app interacts directly with the local SQLite database for instantaneous UI updates and offline reliability. A background `SyncService` listens for connectivity and securely syncs the local state with the Supabase PostgreSQL database using Row Level Security (RLS) policies.
+## 🚧 What's Next (Coming Soon)
+
+We are actively expanding the BooknScore ecosystem. Features currently in development include:
+* **Turf Booking System:** An integrated system to browse, reserve, and manage indoor turf and ground bookings directly through the app.
+* **AI Chatbot Assistant:** A Python FastAPI and LangGraph-powered AI agent capable of instantly answering complex natural language queries about player stats, match histories, and tournament standings.
 
 ## 📱 Download & Test the App
 
@@ -35,3 +40,14 @@ To run this project locally:
 1. Clone the repository:
    ```bash
    git clone [https://github.com/MRoshaan/BooknScore.git](https://github.com/YOUR_USERNAME/BooknScore.git)
+   
+2. Set up your environment variables:
+
+   Create a .env file in the root directory.
+
+   Add your Supabase credentials: 
+   SUPABASE_URL=your_project_url
+   SUPABASE_ANON_KEY=your_anon_key
+
+3. Run : flutter run
+ 
