@@ -39,7 +39,7 @@ To run this project locally:
 ## 🚀 Getting Started
 1. Clone the repository:
    ```bash
-   git clone [https://github.com/MRoshaan/BooknScore.git](https://github.com/YOUR_USERNAME/BooknScore.git)
+   git clone [https://github.com/MRoshaan/BooknScore.git](https://github.com/MRoshaan/BooknScore.git]
    
 2. Set up your environment variables:
 
