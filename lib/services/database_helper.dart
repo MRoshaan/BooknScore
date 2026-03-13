@@ -41,6 +41,9 @@ import 'package:uuid/uuid.dart';
 ///   created_by    TEXT    (user UID for Supabase sync)
 ///   tournament_id INTEGER  → tournaments(id)  NULL = quick/standalone match
 ///
+/// NOTE: tournament_name (TEXT) was removed in DB v17.  The tournament name is
+///   now derived at query time via a JOIN on tournaments.name using tournament_id.
+///
 /// players
 ///   id            INTEGER PRIMARY KEY AUTOINCREMENT
 ///   uuid          TEXT    NOT NULL UNIQUE  (UUID string used as Supabase PK)
@@ -85,7 +88,7 @@ class DatabaseHelper {
   static Database? _db;
 
   static const _dbName    = 'wicket_v2.db';
-  static const _dbVersion = 14;
+  static const _dbVersion = 22;
 
   static final _uuid = Uuid();
 
@@ -96,6 +99,7 @@ class DatabaseHelper {
   static const tableMatchPlayers      = 'match_players';
   static const tableTournaments       = 'tournaments';
   static const tableTournamentTeams   = 'tournament_teams';
+  static const tableTeams             = 'teams';
 
   // ── shared columns ──────────────────────────────────────────────────────
   static const colId             = 'id';
@@ -113,7 +117,6 @@ class DatabaseHelper {
   static const colSyncStatus     = 'sync_status';
   static const colCreatedAt      = 'created_at';
   static const colCreatedBy      = 'created_by';
-  static const colTournamentName = 'tournament_name';
   static const colWinner         = 'winner';
   /// FK → players(id).  Persisted when the match is completed.
   static const colMotmPlayerId   = 'motm_player_id';
@@ -130,6 +133,8 @@ class DatabaseHelper {
   static const colFormat         = 'format';         // 'league' | 'knockout' | 'mixed'
   static const colOversPerMatch  = 'overs_per_match';
   static const colTeams          = 'teams';           // comma-separated list of team names (legacy)
+  /// UUID string used as the Supabase PK for tournaments (mirrors colUuid on matches/players).
+  static const colTournamentUuid = 'uuid';
   /// FK → tournament_teams(id).  Set when the tournament is completed.
   static const colWinnerTeamId   = 'winner_team_id';
 
@@ -142,8 +147,22 @@ class DatabaseHelper {
   static const colName             = 'name';
   static const colTeam             = 'team';
   static const colRole             = 'role';
+  static const colBowlingType      = 'bowling_type';
   static const colLocalAvatarPath  = 'local_avatar_path';
-  
+
+  // ── teams columns ────────────────────────────────────────────────────────
+  static const colTeamUuid         = 'team_uuid';
+
+  // ── matches FK columns (v21) ─────────────────────────────────────────────
+  /// FK → teams(id).  Set when the match is created via the quick-match flow.
+  static const colTeamAId          = 'team_a_id';
+  /// FK → teams(id).  Set when the match is created via the quick-match flow.
+  static const colTeamBId          = 'team_b_id';
+
+  // ── players FK column (v21) ──────────────────────────────────────────────
+  /// FK → teams(id).  Set when a player is assigned to a team via the hub.
+  static const colTeamId           = 'team_id';
+
   // ── match_players columns ───────────────────────────────────────────────
   static const colPlayerId       = 'player_id';
   static const colBattingOrder   = 'batting_order';
@@ -183,9 +202,10 @@ class DatabaseHelper {
     String? tossWinner,
     String? optTo,
     String? createdBy,
-    String? tournamentName,
     int? tournamentId,
     String? matchStage,
+    int? teamAId,
+    int? teamBId,
   }) async {
     final db = await database;
     return db.insert(
@@ -202,9 +222,10 @@ class DatabaseHelper {
         colSyncStatus:     0,
         colCreatedAt:      DateTime.now().toIso8601String(),
         colCreatedBy:      createdBy,
-        colTournamentName: tournamentName,
         colTournamentId:   tournamentId,
         colMatchStage:     matchStage,
+        colTeamAId:        teamAId,
+        colTeamBId:        teamBId,
       },
       conflictAlgorithm: ConflictAlgorithm.replace,
     );
@@ -213,17 +234,87 @@ class DatabaseHelper {
   /// Return all matches, newest first.
   Future<List<Map<String, dynamic>>> fetchAllMatches() async {
     final db = await database;
-    return db.query(tableMatches, orderBy: '$colId DESC');
+    return db.query(tableMatches, orderBy: '$colCreatedAt DESC');
   }
 
-  /// Return only standalone (Quick Match) matches — those with no tournament_id.
+  /// Return only standalone (Quick Match) matches — those with no tournament.
+  ///
+  /// Uses [tournament_id] IS NULL to identify quick matches.  This works for
+  /// both locally-created matches and community matches synced down from
+  /// Supabase (which now carry a proper tournament_id FK or NULL).
   Future<List<Map<String, dynamic>>> fetchQuickMatches() async {
     final db = await database;
     return db.query(
       tableMatches,
       where: '$colTournamentId IS NULL',
-      orderBy: '$colId DESC',
+      orderBy: '$colCreatedAt DESC',
     );
+  }
+
+  /// Fetch quick matches created by a specific user (for "My Matches" tab).
+  Future<List<Map<String, dynamic>>> fetchMyMatches(String userId) async {
+    final db = await database;
+    return db.query(
+      tableMatches,
+      where: '$colTournamentId IS NULL AND $colCreatedBy = ?',
+      whereArgs: [userId],
+      orderBy: '$colCreatedAt DESC',
+    );
+  }
+
+  /// Fetch the most recent [limit] quick matches created by [userId], regardless
+  /// of status (ongoing, live, pending, completed).
+  /// Used by the Dashboard to show a compact "last N matches" view, including
+  /// in-progress matches so they are never hidden when the app is reopened.
+  Future<List<Map<String, dynamic>>> fetchRecentMatches(
+    String userId, {
+    int limit = 5,
+  }) async {
+    final db = await database;
+    return db.query(
+      tableMatches,
+      where: '$colTournamentId IS NULL AND $colCreatedBy = ?',
+      whereArgs: [userId],
+      orderBy: '$colCreatedAt DESC',
+      limit: limit,
+    );
+  }
+
+  /// Persist toss result (winner team name + choice) for a match.
+  Future<void> updateMatchToss(
+    int matchId,
+    String tossWinner,
+    String optTo,
+  ) async {
+    final db = await database;
+    await db.update(
+      tableMatches,
+      {
+        colTossWinner: tossWinner,
+        colOptTo: optTo,
+        colSyncStatus: 0,
+      },
+      where: '$colId = ?',
+      whereArgs: [matchId],
+    );
+  }
+
+  /// Fetch a single match by id, with the tournament name resolved via a JOIN
+  /// on the tournaments table.  Returns all match columns plus an additional
+  /// synthetic key `tournament_name` (String?) derived from
+  /// `tournaments.name`.  Returns null if no match is found.
+  Future<Map<String, dynamic>?> fetchMatchWithTournamentName(int matchId) async {
+    final db = await database;
+    final rows = await db.rawQuery('''
+      SELECT
+        m.*,
+        t.$colName AS tournament_name
+      FROM $tableMatches m
+      LEFT JOIN $tableTournaments t ON t.$colId = m.$colTournamentId
+      WHERE m.$colId = ?
+      LIMIT 1
+    ''', [matchId]);
+    return rows.isNotEmpty ? Map<String, dynamic>.from(rows.first) : null;
   }
 
   /// Return all matches belonging to a specific tournament, newest first.
@@ -233,7 +324,7 @@ class DatabaseHelper {
       tableMatches,
       where: '$colTournamentId = ?',
       whereArgs: [tournamentId],
-      orderBy: '$colId DESC',
+      orderBy: '$colCreatedAt DESC',
     );
   }
 
@@ -246,6 +337,60 @@ class DatabaseHelper {
       whereArgs: [teamName, teamName],
       orderBy: '$colCreatedAt DESC',
     );
+  }
+
+  /// Return the [limit] most-recent standalone (quick) matches — used by the
+  /// Global Matches feed to avoid loading the entire table into memory.
+  Future<List<Map<String, dynamic>>> fetchRecentGlobalMatches({
+    int limit = 15,
+  }) async {
+    final db = await database;
+    return db.query(
+      tableMatches,
+      where: '$colTournamentId IS NULL',
+      orderBy: '$colCreatedAt DESC',
+      limit: limit,
+    );
+  }
+
+  /// Search standalone matches whose team_a OR team_b contains [query]
+  /// (case-insensitive LIKE).  Returns up to [limit] rows, newest first.
+  Future<List<Map<String, dynamic>>> searchGlobalMatches(
+    String query, {
+    int limit = 50,
+  }) async {
+    final db = await database;
+    final like = '%$query%';
+    return db.query(
+      tableMatches,
+      where: '$colTournamentId IS NULL AND ($colTeamA LIKE ? OR $colTeamB LIKE ?)',
+      whereArgs: [like, like],
+      orderBy: '$colCreatedAt DESC',
+      limit: limit,
+    );
+  }
+
+  /// Returns up to [limit] distinct team names that start with [prefix]
+  /// (case-insensitive). Searches team_a/team_b match columns AND the
+  /// dedicated teams table (so hub-created teams appear as suggestions too).
+  Future<List<String>> getDistinctTeamNames({
+    String prefix = '',
+    int limit = 5,
+  }) async {
+    final db = await database;
+    final like = '${prefix.trim()}%';
+    final rows = await db.rawQuery('''
+      SELECT DISTINCT name FROM (
+        SELECT $colTeamA AS name FROM $tableMatches WHERE $colTeamA LIKE ?
+        UNION
+        SELECT $colTeamB AS name FROM $tableMatches WHERE $colTeamB LIKE ?
+        UNION
+        SELECT $colName  AS name FROM $tableTeams   WHERE $colName  LIKE ?
+      )
+      ORDER BY name ASC
+      LIMIT ?
+    ''', [like, like, like, limit]);
+    return rows.map((r) => r['name'] as String).toList();
   }
 
   /// Fetch a single match by id.
@@ -421,6 +566,62 @@ class DatabaseHelper {
     );
   }
 
+  /// Fetch all ball events for a match with player names resolved via a single
+  /// SQL JOIN — avoids N+1 lookups.
+  ///
+  /// Returns a list of maps with the original ball_event columns plus:
+  ///   striker_name     – name of the striking batter (or 'Unknown')
+  ///   non_striker_name – name of the non-striking batter (or 'Unknown')
+  ///   bowler_name      – name of the bowler (or 'Unknown')
+  ///   out_player_name  – name of the dismissed player, or null
+  ///
+  /// Results are ordered innings → over → ball (ascending).
+  Future<List<Map<String, dynamic>>> getBallEventsWithPlayerNames(
+    int matchId, {
+    int? innings,
+  }) async {
+    final db = await database;
+
+    final inningsClause = innings != null
+        ? 'AND be.$colInnings = $innings'
+        : '';
+
+    // Three LEFT JOINs: one per player role.
+    // Aliases: ps = striker, pn = non_striker, pb = bowler, po = out_player
+    final sql = '''
+      SELECT
+        be.$colId,
+        be.$colMatchId,
+        be.$colInnings,
+        be.$colOverNum,
+        be.$colBallNum,
+        be.$colRunsScored,
+        be.$colIsBoundary,
+        be.$colIsWicket,
+        be.$colWicketType,
+        be.$colExtraType,
+        be.$colExtraRuns,
+        be.$colStrikerId,
+        be.$colNonStrikerId,
+        be.$colBowlerId,
+        be.$colOutPlayerId,
+        COALESCE(ps.$colName, 'Unknown') AS striker_name,
+        COALESCE(pn.$colName, 'Unknown') AS non_striker_name,
+        COALESCE(pb.$colName, 'Unknown') AS bowler_name,
+        po.$colName                      AS out_player_name
+      FROM $tableBallEvents be
+      LEFT JOIN $tablePlayers ps ON ps.$colId = be.$colStrikerId
+      LEFT JOIN $tablePlayers pn ON pn.$colId = be.$colNonStrikerId
+      LEFT JOIN $tablePlayers pb ON pb.$colId = be.$colBowlerId
+      LEFT JOIN $tablePlayers po ON po.$colId = be.$colOutPlayerId
+      WHERE be.$colMatchId = $matchId
+      $inningsClause
+      ORDER BY be.$colInnings ASC, be.$colOverNum ASC, be.$colBallNum ASC
+    ''';
+
+    return db.rawQuery(sql);
+  }
+
   /// Fetch the current over's ball events.
   Future<List<Map<String, dynamic>>> fetchCurrentOverBalls(
     int matchId,
@@ -552,6 +753,7 @@ class DatabaseHelper {
     required String name,
     required String team,
     String? role,
+    String? bowlingType,
     String? localAvatarPath,
     String? createdBy,
   }) async {
@@ -563,6 +765,7 @@ class DatabaseHelper {
         colName:            name,
         colTeam:            team,
         colRole:            role,
+        colBowlingType:     bowlingType,
         colLocalAvatarPath: localAvatarPath,
         colSyncStatus:      0,
         colCreatedAt:       DateTime.now().toIso8601String(),
@@ -607,11 +810,43 @@ class DatabaseHelper {
     return db.query(tablePlayers, orderBy: '$colName ASC');
   }
 
-  /// Update a player's name, team, role, and optional avatar path.
+  /// Fetch players visible to [userId]: those they created themselves OR those
+  /// belonging to a team that appears in any of their matches.
+  /// Falls back to all players if [userId] is null.
+  Future<List<Map<String, dynamic>>> fetchPlayersForUser(String? userId) async {
+    if (userId == null) return fetchAllPlayers();
+    final db = await database;
+    final rows = await db.rawQuery('''
+      SELECT DISTINCT p.*
+      FROM $tablePlayers p
+      WHERE p.$colCreatedBy = ?
+         OR p.$colTeam IN (
+           SELECT $colTeamA FROM $tableMatches WHERE $colCreatedBy = ?
+           UNION
+           SELECT $colTeamB FROM $tableMatches WHERE $colCreatedBy = ?
+         )
+      ORDER BY p.$colName ASC
+    ''', [userId, userId, userId]);
+    return rows.map((r) => Map<String, dynamic>.from(r)).toList();
+  }
+
+  /// Returns all distinct team names stored in the players table, sorted
+  /// alphabetically.  Used for autocomplete suggestions when creating a
+  /// tournament or adding a team.
+  Future<List<String>> fetchDistinctTeamNames() async {
+    final db = await database;
+    final rows = await db.rawQuery(
+      'SELECT DISTINCT $colTeam FROM $tablePlayers ORDER BY $colTeam ASC',
+    );
+    return rows.map((r) => r[colTeam] as String).toList();
+  }
+
+  /// Update a player's name, team, role, bowling type, and optional avatar path.
   Future<void> updatePlayer(int playerId, {
     required String name,
     required String team,
     String? role,
+    String? bowlingType,
     String? localAvatarPath,
   }) async {
     final db = await database;
@@ -621,6 +856,7 @@ class DatabaseHelper {
         colName:            name,
         colTeam:            team,
         colRole:            role,
+        colBowlingType:     bowlingType,
         colLocalAvatarPath: localAvatarPath,
         colSyncStatus:      0,
       },
@@ -645,6 +881,152 @@ class DatabaseHelper {
       limit: 1,
     );
     return results.isNotEmpty ? results.first : null;
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // TEAMS
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /// Insert a new team and return its auto-generated SQLite id.
+  Future<int> insertTeam({
+    required String name,
+    String? createdBy,
+  }) async {
+    final db = await database;
+    return db.insert(
+      tableTeams,
+      {
+        colTeamUuid:   _uuid.v4(),
+        colName:       name.trim(),
+        colSyncStatus: 0,
+        colCreatedAt:  DateTime.now().toIso8601String(),
+        colCreatedBy:  createdBy,
+      },
+      conflictAlgorithm: ConflictAlgorithm.replace,
+    );
+  }
+
+  /// Fetch all teams created by [userId].  Falls back to all teams if null.
+  Future<List<Map<String, dynamic>>> fetchTeamsByUser(String? userId) async {
+    final db = await database;
+    if (userId == null) return fetchAllTeams();
+    return db.query(
+      tableTeams,
+      where: '$colCreatedBy = ?',
+      whereArgs: [userId],
+      orderBy: '$colName ASC',
+    );
+  }
+
+  /// Fetch ALL teams, ordered by name.
+  Future<List<Map<String, dynamic>>> fetchAllTeams() async {
+    final db = await database;
+    return db.query(tableTeams, orderBy: '$colName ASC');
+  }
+
+  /// Fetch a single team row by its SQLite id.
+  Future<Map<String, dynamic>?> fetchTeam(int teamId) async {
+    final db = await database;
+    final rows = await db.query(
+      tableTeams,
+      where: '$colId = ?',
+      whereArgs: [teamId],
+      limit: 1,
+    );
+    return rows.isNotEmpty ? rows.first : null;
+  }
+
+  /// Update the team name (marks as unsynced).
+  Future<void> updateTeamName(int teamId, String name) async {
+    final db = await database;
+    await db.update(
+      tableTeams,
+      {colName: name.trim(), colSyncStatus: 0},
+      where: '$colId = ?',
+      whereArgs: [teamId],
+    );
+  }
+
+  /// Delete a team by SQLite id.
+  Future<void> deleteTeam(int teamId) async {
+    final db = await database;
+    await db.delete(tableTeams, where: '$colId = ?', whereArgs: [teamId]);
+  }
+
+  /// Returns all teams with [colSyncStatus] == 0 (not yet pushed to Supabase).
+  Future<List<Map<String, dynamic>>> fetchUnsyncedTeams() async {
+    final db = await database;
+    return db.query(
+      tableTeams,
+      where: '$colSyncStatus = 0',
+    );
+  }
+
+  /// Mark a team row as synced (sets [colSyncStatus] to 1).
+  Future<void> markTeamSynced(int teamId) async {
+    final db = await database;
+    await db.update(
+      tableTeams,
+      {colSyncStatus: 1},
+      where: '$colId = ?',
+      whereArgs: [teamId],
+    );
+  }
+
+  /// Look up a team by exact name (case-sensitive). Returns null if not found.
+  Future<Map<String, dynamic>?> fetchTeamByName(String name) async {
+    final db = await database;
+    final rows = await db.query(
+      tableTeams,
+      where: '$colName = ?',
+      whereArgs: [name.trim()],
+      limit: 1,
+    );
+    return rows.isNotEmpty ? rows.first : null;
+  }
+
+  /// Find-or-create a team by name.
+  ///
+  /// Returns the SQLite [id] of the existing or newly-created row so callers
+  /// can use it as a FK without first checking whether the row exists.
+  Future<int> ensureTeamExists(String name, {String? createdBy}) async {
+    final trimmed = name.trim();
+    final existing = await fetchTeamByName(trimmed);
+    if (existing != null) return existing[colId] as int;
+    return insertTeam(name: trimmed, createdBy: createdBy);
+  }
+
+  /// Fetch all players whose [colTeamId] FK points to [teamId].
+  ///
+  /// Falls back gracefully if the column doesn't exist yet (returns empty list).
+  Future<List<Map<String, dynamic>>> fetchPlayersByTeamId(int teamId) async {
+    final db = await database;
+    return db.query(
+      tablePlayers,
+      where: '$colTeamId = ?',
+      whereArgs: [teamId],
+      orderBy: '$colName ASC',
+    );
+  }
+
+  /// Update a player's team FK ([colTeamId]) and the legacy TEXT column
+  /// ([colTeam]) so existing queries that filter on [colTeam] keep working.
+  Future<void> updatePlayerTeamId(
+    int playerId,
+    int teamId,
+    String teamName,
+  ) async {
+    final db = await database;
+    await db.update(
+      tablePlayers,
+      {
+        colTeamId:     teamId,
+        colTeam:       teamName,
+        colSyncStatus: 0,
+      },
+      where: '$colId = ?',
+      whereArgs: [playerId],
+    );
   }
 
   // ══════════════════════════════════════════════════════════════════════════
@@ -779,16 +1161,19 @@ class DatabaseHelper {
       // All runs count against bowler except byes/leg byes
       if (extraType != 'bye' && extraType != 'leg_bye') {
         runsConceded += runsScored + extraRuns;
-      } else {
-        // Byes/leg byes still add to runs conceded for economy but not as "bowler's runs"
-        runsConceded += extraRuns;
       }
+      // bye / leg_bye: add zero to runsConceded (not charged to bowler).
       
       // Count legal deliveries
       if (extraType != 'wide' && extraType != 'no_ball') {
         legalBalls++;
         ballsPerOver[overNum] = (ballsPerOver[overNum] ?? 0) + 1;
-        runsPerOver[overNum] = (runsPerOver[overNum] ?? 0) + runsScored + extraRuns;
+        // Byes/LBs don't cancel a maiden — only runs charged to bowler count
+        if (extraType != 'bye' && extraType != 'leg_bye') {
+          runsPerOver[overNum] = (runsPerOver[overNum] ?? 0) + runsScored + extraRuns;
+        } else {
+          runsPerOver[overNum] = (runsPerOver[overNum] ?? 0);
+        }
       } else {
         // Extras add to runs in that over
         runsPerOver[overNum] = (runsPerOver[overNum] ?? 0) + extraRuns;
@@ -1007,6 +1392,7 @@ class DatabaseHelper {
     final id = await db.insert(
       tableTournaments,
       {
+        colTournamentUuid: _uuid.v4(),
         colName:          name,
         colFormat:        format,
         colOversPerMatch: oversPerMatch,
@@ -1039,6 +1425,17 @@ class DatabaseHelper {
   Future<List<Map<String, dynamic>>> fetchAllTournaments() async {
     final db = await database;
     return db.query(tableTournaments, orderBy: '$colId DESC');
+  }
+
+  /// Fetch all tournaments created by [userId], newest first.
+  Future<List<Map<String, dynamic>>> fetchTournamentsByCreator(String userId) async {
+    final db = await database;
+    return db.query(
+      tableTournaments,
+      where: '$colCreatedBy = ?',
+      whereArgs: [userId],
+      orderBy: '$colId DESC',
+    );
   }
 
   /// Fetch a single tournament by id.
@@ -1360,17 +1757,18 @@ class DatabaseHelper {
   Future<void> _onCreate(Database db, int version) async {
     // ── tournaments ────────────────────────────────────────────────────────
     await db.execute('''
-      CREATE TABLE $tableTournaments (
-        $colId            INTEGER PRIMARY KEY AUTOINCREMENT,
-        $colName          TEXT    NOT NULL,
-        $colFormat        TEXT    NOT NULL DEFAULT 'league',
-        $colOversPerMatch INTEGER NOT NULL DEFAULT 20,
-        $colTeams         TEXT    NOT NULL DEFAULT '',
-        $colStatus        TEXT    NOT NULL DEFAULT 'active',
-        $colCreatedAt     TEXT    NOT NULL,
-        $colCreatedBy     TEXT,
-        $colWinnerTeamId  INTEGER
-      )
+       CREATE TABLE $tableTournaments (
+         $colId            INTEGER PRIMARY KEY AUTOINCREMENT,
+         $colTournamentUuid TEXT   NOT NULL UNIQUE DEFAULT '',
+         $colName          TEXT    NOT NULL,
+         $colFormat        TEXT    NOT NULL DEFAULT 'league',
+         $colOversPerMatch INTEGER NOT NULL DEFAULT 20,
+         $colTeams         TEXT    NOT NULL DEFAULT '',
+         $colStatus        TEXT    NOT NULL DEFAULT 'active',
+         $colCreatedAt     TEXT    NOT NULL,
+         $colCreatedBy     TEXT,
+         $colWinnerTeamId  INTEGER
+       )
     ''');
 
     await db.execute('''
@@ -1383,11 +1781,24 @@ class DatabaseHelper {
     ''');
 
     await db.execute('''
+      CREATE TABLE $tableTeams (
+        $colId         INTEGER PRIMARY KEY AUTOINCREMENT,
+        $colTeamUuid   TEXT    NOT NULL UNIQUE DEFAULT '',
+        $colName       TEXT    NOT NULL,
+        $colSyncStatus INTEGER NOT NULL DEFAULT 0,
+        $colCreatedAt  TEXT    NOT NULL,
+        $colCreatedBy  TEXT
+      )
+    ''');
+
+    await db.execute('''
       CREATE TABLE $tableMatches (
         $colId              INTEGER PRIMARY KEY AUTOINCREMENT,
-        $colUuid            TEXT    NOT NULL DEFAULT '',
+        $colUuid            TEXT    NOT NULL UNIQUE DEFAULT '',
         $colTeamA           TEXT    NOT NULL,
         $colTeamB           TEXT    NOT NULL,
+        $colTeamAId         INTEGER REFERENCES $tableTeams($colId),
+        $colTeamBId         INTEGER REFERENCES $tableTeams($colId),
         $colTotalOvers      INTEGER NOT NULL,
         $colTossWinner      TEXT,
         $colOptTo           TEXT,
@@ -1397,7 +1808,6 @@ class DatabaseHelper {
         $colSyncStatus      INTEGER NOT NULL DEFAULT 0,
         $colCreatedAt       TEXT    NOT NULL,
         $colCreatedBy       TEXT,
-        $colTournamentName  TEXT,
         $colWinner          TEXT,
         $colMotmPlayerId    INTEGER,
         $colTournamentId    INTEGER REFERENCES $tableTournaments($colId),
@@ -1409,10 +1819,12 @@ class DatabaseHelper {
     await db.execute('''
       CREATE TABLE $tablePlayers (
         $colId               INTEGER PRIMARY KEY AUTOINCREMENT,
-        $colUuid             TEXT    NOT NULL DEFAULT '',
+        $colUuid             TEXT    NOT NULL UNIQUE DEFAULT '',
         $colName             TEXT    NOT NULL,
         $colTeam             TEXT    NOT NULL,
+        $colTeamId           INTEGER REFERENCES $tableTeams($colId),
         $colRole             TEXT,
+        $colBowlingType      TEXT,
         $colLocalAvatarPath  TEXT,
         $colSyncStatus       INTEGER NOT NULL DEFAULT 0,
         $colCreatedAt        TEXT    NOT NULL,
@@ -1461,6 +1873,11 @@ class DatabaseHelper {
     ''');
     
     await db.execute('''
+      CREATE INDEX idx_ball_events_match_innings
+        ON $tableBallEvents($colMatchId, $colInnings)
+    ''');
+    
+    await db.execute('''
       CREATE INDEX idx_ball_events_sync ON $tableBallEvents($colSyncStatus)
     ''');
     
@@ -1478,6 +1895,18 @@ class DatabaseHelper {
 
     await db.execute('''
       CREATE INDEX idx_matches_tournament ON $tableMatches($colTournamentId)
+    ''');
+
+    // Unique indexes on uuid so INSERT OR REPLACE deduplicates by UUID.
+    await db.execute('''
+      CREATE UNIQUE INDEX idx_matches_uuid
+        ON $tableMatches($colUuid)
+        WHERE $colUuid != ''
+    ''');
+    await db.execute('''
+      CREATE UNIQUE INDEX idx_players_uuid
+        ON $tablePlayers($colUuid)
+        WHERE $colUuid != ''
     ''');
   }
 
@@ -1500,8 +1929,9 @@ class DatabaseHelper {
     }
     
     if (oldVersion < 5) {
-      // Migration to v5 - add tournament_name column to matches
-      await db.execute('ALTER TABLE $tableMatches ADD COLUMN $colTournamentName TEXT');
+      // Migration to v5 — tournament_name column was added here historically.
+      // In v17 this column is removed; this block intentionally left empty so
+      // the version-sequence is preserved for devices upgrading from v4.
     }
     
     if (oldVersion < 6) {
@@ -1643,6 +2073,178 @@ class DatabaseHelper {
       await db.execute('''
         CREATE INDEX IF NOT EXISTS idx_tournament_teams_tournament
           ON $tableTournamentTeams($colTournamentId)
+      ''');
+    }
+
+    if (oldVersion < 15) {
+      // Migration to v15 — enforce UNIQUE on matches.uuid and players.uuid so
+      // that INSERT OR REPLACE correctly replaces an existing row by its UUID
+      // rather than appending a duplicate.
+      //
+      // SQLite does not support ADD CONSTRAINT on existing tables.  The
+      // standard workaround is to create a unique index — SQLite treats a
+      // unique index exactly like a UNIQUE column constraint for the purpose
+      // of conflict resolution (including REPLACE semantics).
+      //
+      // Step 1: delete duplicate rows, keeping only the highest id per uuid.
+      //   This must happen BEFORE the index is created, otherwise the CREATE
+      //   UNIQUE INDEX statement itself would fail.
+      await db.execute('''
+        DELETE FROM $tableMatches
+        WHERE $colId NOT IN (
+          SELECT MAX($colId) FROM $tableMatches
+          WHERE $colUuid != ''
+          GROUP BY $colUuid
+        ) AND $colUuid != ''
+      ''');
+      await db.execute('''
+        DELETE FROM $tablePlayers
+        WHERE $colId NOT IN (
+          SELECT MAX($colId) FROM $tablePlayers
+          WHERE $colUuid != ''
+          GROUP BY $colUuid
+        ) AND $colUuid != ''
+      ''');
+
+      // Step 2: create the unique indexes.
+      await db.execute('''
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_matches_uuid
+          ON $tableMatches($colUuid)
+          WHERE $colUuid != ''
+      ''');
+      await db.execute('''
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_players_uuid
+          ON $tablePlayers($colUuid)
+          WHERE $colUuid != ''
+      ''');
+    }
+
+    if (oldVersion < 16) {
+      // Migration to v16 — add uuid column to tournaments so they can be
+      // synced to / from Supabase.  Existing rows receive a freshly generated
+      // UUID so they are pushed to Supabase on the next sync run.
+      await db.execute(
+        'ALTER TABLE $tableTournaments ADD COLUMN $colTournamentUuid TEXT NOT NULL DEFAULT \'\'',
+      );
+      // Back-fill UUIDs for existing tournament rows.
+      final tournaments = await db.query(tableTournaments, columns: [colId]);
+      for (final t in tournaments) {
+        await db.update(
+          tableTournaments,
+          {colTournamentUuid: _uuid.v4()},
+          where: '$colId = ?',
+          whereArgs: [t[colId]],
+        );
+      }
+      // Create a unique index so INSERT OR REPLACE resolves by UUID.
+      await db.execute('''
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_tournaments_uuid
+          ON $tableTournaments($colTournamentUuid)
+          WHERE $colTournamentUuid != ''
+      ''');
+    }
+
+    if (oldVersion < 17) {
+      // Migration to v17 — retire the tournament_name TEXT column on matches.
+      //
+      // SQLite does not support DROP COLUMN on the versions typically bundled
+      // with Android/iOS.  The column is left in place on existing installs —
+      // it is simply no longer written to or read from application code.
+      // New installs (created by _onCreate at v17+) never have this column.
+      //
+      // The colTournamentId INTEGER FK (added in v10) remains the sole link
+      // between a match and its tournament.  Tournament names are now resolved
+      // at query time via a JOIN on the tournaments table.
+      //
+      // No ALTER statements needed — the schema change is purely application-
+      // level (stop reading/writing colTournamentName everywhere in Dart code).
+    }
+
+    if (oldVersion < 18) {
+      // Migration to v18 — add a composite index on ball_events(match_id, innings).
+      //
+      // Nearly every ball-event query filters on BOTH match_id AND innings
+      // (e.g. getInningsSummary, fetchBallEvents with innings filter,
+      // getWicketEvents).  The existing single-column idx_ball_events_match
+      // index helps for match_id-only scans but leaves the secondary innings
+      // predicate to be evaluated row-by-row.  A covering composite index
+      // eliminates that extra scan and also orders results by innings, which
+      // matches the ORDER BY clause in fetchBallEvents.
+      await db.execute('''
+        CREATE INDEX IF NOT EXISTS idx_ball_events_match_innings
+          ON $tableBallEvents($colMatchId, $colInnings)
+      ''');
+    }
+
+    if (oldVersion < 19) {
+      // Migration to v19 — add bowling_type column to players table.
+      // Nullable TEXT; valid values are 'Fast' and 'Spin'.
+      // Only relevant when role is 'bowler' or 'all-rounder'.
+      await db.execute(
+        'ALTER TABLE $tablePlayers ADD COLUMN $colBowlingType TEXT',
+      );
+    }
+
+    if (oldVersion < 20) {
+      // Migration to v20 — add dedicated teams table for team management.
+      // Previously teams were only TEXT strings in players.team / matches.team_a/b.
+      await db.execute('''
+        CREATE TABLE IF NOT EXISTS $tableTeams (
+          $colId         INTEGER PRIMARY KEY AUTOINCREMENT,
+          $colTeamUuid   TEXT    NOT NULL UNIQUE DEFAULT '',
+          $colName       TEXT    NOT NULL,
+          $colSyncStatus INTEGER NOT NULL DEFAULT 0,
+          $colCreatedAt  TEXT    NOT NULL,
+          $colCreatedBy  TEXT
+        )
+      ''');
+    }
+
+    if (oldVersion < 21) {
+      // Migration to v21 — add relational FK columns.
+      //   matches.team_a_id  → teams(id)
+      //   matches.team_b_id  → teams(id)
+      //   players.team_id    → teams(id)
+      // SQLite does not support adding FK constraints via ALTER TABLE, so the
+      // columns are added as plain INTEGER columns (FK enforcement is
+      // application-level here, same as the rest of this schema).
+      await db.execute(
+        'ALTER TABLE $tableMatches ADD COLUMN $colTeamAId INTEGER',
+      );
+      await db.execute(
+        'ALTER TABLE $tableMatches ADD COLUMN $colTeamBId INTEGER',
+      );
+      await db.execute(
+        'ALTER TABLE $tablePlayers ADD COLUMN $colTeamId INTEGER',
+      );
+      // Add an index on players.team_id for fast roster lookups.
+      await db.execute('''
+        CREATE INDEX IF NOT EXISTS idx_players_team_id
+          ON $tablePlayers($colTeamId)
+      ''');
+    }
+
+    if (oldVersion < 22) {
+      // Migration to v22 — deduplicate ball_events rows created by
+      // syncDownInitialData blindly inserting without deleting existing rows.
+      //
+      // Two rows are considered duplicates when they share the same
+      // (match_id, innings, over_number, ball_number, runs_scored, extra_type,
+      //  extra_runs, is_wicket, sync_status = 1).  We keep the row with the
+      // highest id (most recently inserted) and delete the rest.
+      //
+      // Only sync_status = 1 rows (pulled from Supabase) can be duplicated by
+      // the down-sync.  Locally-created rows (sync_status = 0) are untouched.
+      await db.execute('''
+        DELETE FROM $tableBallEvents
+        WHERE $colSyncStatus = 1
+          AND $colId NOT IN (
+            SELECT MAX($colId)
+            FROM $tableBallEvents
+            WHERE $colSyncStatus = 1
+            GROUP BY $colMatchId, $colInnings, $colOverNum, $colBallNum,
+                     $colRunsScored, $colExtraType, $colExtraRuns, $colIsWicket
+          )
       ''');
     }
 

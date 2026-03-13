@@ -1,4 +1,4 @@
-// Wicket.pk Models
+// BooknScore Models
 // Export file for data models used across the app.
 
 // Ball event model is defined in match_provider.dart

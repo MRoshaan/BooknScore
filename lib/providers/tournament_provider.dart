@@ -1,6 +1,7 @@
 import 'dart:developer' as developer;
 import 'package:flutter/foundation.dart';
 
+import '../services/auth_service.dart';
 import '../services/database_helper.dart';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -69,7 +70,12 @@ class TournamentProvider extends ChangeNotifier {
     notifyListeners();
 
     try {
-      _tournaments = await DatabaseHelper.instance.fetchAllTournaments();
+      final userId = AuthService.instance.currentUser?.id;
+      if (userId == null) {
+        _tournaments = [];
+      } else {
+        _tournaments = await DatabaseHelper.instance.fetchTournamentsByCreator(userId);
+      }
     } catch (e, st) {
       developer.log('loadTournaments failed', name: 'TournamentProvider', error: e, stackTrace: st);
       _error = 'Failed to load tournaments.';
@@ -196,17 +202,39 @@ class TournamentProvider extends ChangeNotifier {
       final winner   = match[DatabaseHelper.colWinner] as String?;
       final totalOversAllowed = match[DatabaseHelper.colTotalOvers] as int;
 
+      // Determine which team actually batted in innings 1.
+      // The toss winner may have chosen to field first, meaning colTeamB bats
+      // in innings 1 even though innings 1 is stored as the "first" innings.
+      // Mirror the same logic used by MatchProvider.battingTeam.
+      final tossWinner = match[DatabaseHelper.colTossWinner] as String?;
+      final optTo      = match[DatabaseHelper.colOptTo]      as String?;
+      String inn1BattingTeam;
+      if (tossWinner == null || optTo == null) {
+        inn1BattingTeam = teamA; // no toss data → default assumption
+      } else {
+        final tossWinnerBats = optTo == 'bat';
+        inn1BattingTeam = tossWinnerBats
+            ? tossWinner
+            : (tossWinner == teamA ? teamB : teamA);
+      }
+      // If teamB batted first we need to swap which innings belongs to which team.
+      final teamABattedFirst = (inn1BattingTeam == teamA);
+
       // Fetch innings summaries for both innings
       final inn1 = await db.getInningsSummary(matchId, 1);
       final inn2 = await db.getInningsSummary(matchId, 2);
 
-      final runsA    = inn1['totalRuns']    ?? 0;
-      final wicketsA = inn1['totalWickets'] ?? 0;
-      final legalBallsA = inn1['legalBalls'] ?? 0;
+      // Assign innings data to the correct team.
+      final innA = teamABattedFirst ? inn1 : inn2;
+      final innB = teamABattedFirst ? inn2 : inn1;
 
-      final runsB    = inn2['totalRuns']    ?? 0;
-      final wicketsB = inn2['totalWickets'] ?? 0;
-      final legalBallsB = inn2['legalBalls'] ?? 0;
+      final runsA    = innA['totalRuns']    ?? 0;
+      final wicketsA = innA['totalWickets'] ?? 0;
+      final legalBallsA = innA['legalBalls'] ?? 0;
+
+      final runsB    = innB['totalRuns']    ?? 0;
+      final wicketsB = innB['totalWickets'] ?? 0;
+      final legalBallsB = innB['legalBalls'] ?? 0;
 
       // Squad size: use match's squad_size column to determine the all-out
       // threshold (squad_size - 1 wickets = all out).

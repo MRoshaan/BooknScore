@@ -5,6 +5,7 @@ import 'package:provider/provider.dart';
 
 import '../providers/tournament_provider.dart';
 import '../services/auth_service.dart';
+import '../services/database_helper.dart';
 
 // ── Palette (mirrors dashboard) ───────────────────────────────────────────────
 const Color _accentGreen  = Color(0xFF39FF14);
@@ -36,6 +37,20 @@ class _CreateTournamentScreenState extends State<CreateTournamentScreen> {
   String _format = 'league';  // 'league' | 'knockout' | 'mixed'
   final List<String> _teams = [];
   bool _saving = false;
+  List<String> _teamSuggestions = [];
+  // Incrementing this key resets the Autocomplete widget (clears its field).
+  int _autocompleteKey = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadTeamSuggestions();
+  }
+
+  Future<void> _loadTeamSuggestions() async {
+    final names = await DatabaseHelper.instance.fetchDistinctTeamNames();
+    if (mounted) setState(() => _teamSuggestions = names);
+  }
 
   @override
   void dispose() {
@@ -89,7 +104,11 @@ class _CreateTournamentScreenState extends State<CreateTournamentScreen> {
       ));
       return;
     }
-    setState(() { _teams.add(name); _teamCtrl.clear(); });
+    setState(() {
+      _teams.add(name);
+      _teamCtrl.clear();
+      _autocompleteKey++; // reset Autocomplete field
+    });
   }
 
   void _removeTeam(int index) => setState(() => _teams.removeAt(index));
@@ -236,17 +255,95 @@ class _CreateTournamentScreenState extends State<CreateTournamentScreen> {
                       Row(
                         children: [
                           Expanded(
-                            child: TextFormField(
-                              controller: _teamCtrl,
-                              textCapitalization: TextCapitalization.words,
-                              style: GoogleFonts.rajdhani(
-                                  fontSize: 15, fontWeight: FontWeight.w600, color: _textPrimary),
-                              decoration: _input(
-                                'Team Name',
-                                hint: 'e.g. Karachi Kings',
-                                icon: Icons.shield_outlined,
-                              ),
-                              onFieldSubmitted: (_) => _addTeam(),
+                            child: Autocomplete<String>(
+                              key: ValueKey(_autocompleteKey),
+                              optionsBuilder: (TextEditingValue value) {
+                                if (value.text.isEmpty) return const [];
+                                final query = value.text.toLowerCase();
+                                return _teamSuggestions
+                                    .where((t) => t.toLowerCase().contains(query))
+                                    .take(5);
+                              },
+                              onSelected: (String selection) {
+                                _teamCtrl.text = selection;
+                              },
+                              fieldViewBuilder: (context, controller, focusNode, onSubmitted) {
+                                // Keep _teamCtrl in sync with the autocomplete's
+                                // internal controller so _addTeam() can read it.
+                                controller.addListener(() {
+                                  if (_teamCtrl.text != controller.text) {
+                                    _teamCtrl.text = controller.text;
+                                  }
+                                });
+                                return TextFormField(
+                                  controller: controller,
+                                  focusNode: focusNode,
+                                  textCapitalization: TextCapitalization.words,
+                                  style: GoogleFonts.rajdhani(
+                                      fontSize: 15,
+                                      fontWeight: FontWeight.w600,
+                                      color: _textPrimary),
+                                  decoration: _input(
+                                    'Team Name',
+                                    hint: 'e.g. Karachi Kings',
+                                    icon: Icons.shield_outlined,
+                                  ),
+                                  onFieldSubmitted: (_) {
+                                    onSubmitted();
+                                    _addTeam();
+                                  },
+                                );
+                              },
+                              optionsViewBuilder: (context, onSelected, options) {
+                                return Align(
+                                  alignment: Alignment.topLeft,
+                                  child: Material(
+                                    color: _surfaceCard2,
+                                    borderRadius: BorderRadius.circular(10),
+                                    elevation: 8,
+                                    child: ConstrainedBox(
+                                      constraints: const BoxConstraints(maxHeight: 200),
+                                      child: ListView.builder(
+                                        padding: EdgeInsets.zero,
+                                        shrinkWrap: true,
+                                        itemCount: options.length,
+                                        itemBuilder: (_, i) {
+                                          final opt = options.elementAt(i);
+                                          return InkWell(
+                                            onTap: () => onSelected(opt),
+                                            child: Container(
+                                              padding: const EdgeInsets.symmetric(
+                                                  horizontal: 16, vertical: 12),
+                                              decoration: BoxDecoration(
+                                                border: Border(
+                                                  bottom: BorderSide(
+                                                    color: const Color(0xFF2A2A2A),
+                                                    width: i < options.length - 1 ? 1 : 0,
+                                                  ),
+                                                ),
+                                              ),
+                                              child: Row(
+                                                children: [
+                                                  const Icon(Icons.shield_outlined,
+                                                      size: 14, color: _accentGreen),
+                                                  const SizedBox(width: 10),
+                                                  Text(
+                                                    opt,
+                                                    style: GoogleFonts.rajdhani(
+                                                        fontSize: 14,
+                                                        fontWeight: FontWeight.w600,
+                                                        color: _textPrimary),
+                                                  ),
+                                                ],
+                                              ),
+                                            ),
+                                          );
+                                        },
+                                      ),
+                                    ),
+                                  ),
+                                );
+                              },
                             ),
                           ),
                           const SizedBox(width: 10),

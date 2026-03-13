@@ -4,24 +4,14 @@ import 'package:google_fonts/google_fonts.dart';
 import 'package:provider/provider.dart';
 
 import '../services/database_helper.dart';
-import '../providers/match_provider.dart';
 import '../providers/tournament_provider.dart';
+import '../theme.dart';
 import 'new_match_screen.dart';
 import 'scoring_screen.dart';
+import 'scorecard_screen.dart';
 import 'match_summary_screen.dart';
+import '../services/auth_service.dart';
 import 'team_history_screen.dart';
-
-// ── Brand Palette ─────────────────────────────────────────────────────────────
-const Color _accentGreen    = Color(0xFF39FF14);
-const Color _accentGreenMid = Color(0xFF4CAF50);
-const Color _surfaceDark    = Color(0xFF0A0A0A);
-const Color _surfaceCard    = Color(0xFF141414);
-const Color _surfaceCard2   = Color(0xFF1C1C1C);
-const Color _textPrimary    = Colors.white;
-const Color _textSecondary  = Color(0xFF8A8A8A);
-const Color _liveRed        = Color(0xFFFF3D3D);
-const Color _completedBlue  = Color(0xFF2196F3);
-const Color _trophyGold     = Color(0xFFFFC107);
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -66,6 +56,24 @@ class _TournamentDashboardScreenState extends State<TournamentDashboardScreen>
 
   // ── Data Loading ────────────────────────────────────────────────────────────
 
+  /// Sort a match list newest-first by [created_at], falling back gracefully.
+  List<Map<String, dynamic>> _sortedNewestFirst(List<Map<String, dynamic>> list) {
+    final sorted = List<Map<String, dynamic>>.from(list);
+    sorted.sort((a, b) {
+      final ca = a[DatabaseHelper.colCreatedAt] as String?;
+      final cb = b[DatabaseHelper.colCreatedAt] as String?;
+      if (ca == null && cb == null) return 0;
+      if (ca == null) return 1;
+      if (cb == null) return -1;
+      try {
+        return DateTime.parse(cb).compareTo(DateTime.parse(ca));
+      } catch (_) {
+        return 0;
+      }
+    });
+    return sorted;
+  }
+
   Future<void> _loadAll() async {
     setState(() => _loadingMeta = true);
     try {
@@ -73,7 +81,6 @@ class _TournamentDashboardScreenState extends State<TournamentDashboardScreen>
       final t = await db.fetchTournament(widget.tournamentId);
       final m = await db.fetchMatchesByTournament(widget.tournamentId);
 
-      // Resolve the winner team name for the champions banner.
       String? winnerName;
       final winnerTeamId = t?[DatabaseHelper.colWinnerTeamId];
       if (winnerTeamId != null) {
@@ -93,7 +100,7 @@ class _TournamentDashboardScreenState extends State<TournamentDashboardScreen>
       if (mounted) {
         setState(() {
           _tournament = t;
-          _matches = m;
+          _matches = _sortedNewestFirst(m);
           _resolvedWinnerName = winnerName;
           _loadingMeta = false;
         });
@@ -118,53 +125,67 @@ class _TournamentDashboardScreenState extends State<TournamentDashboardScreen>
 
   // ── Navigation ──────────────────────────────────────────────────────────────
 
-  void _openScoring(int matchId) {
-    context.read<MatchProvider>().loadMatch(matchId);
-    Navigator.push(
-      context,
-      MaterialPageRoute(builder: (_) => ScoringScreen(matchId: matchId)),
-    ).then((_) => _loadAll());
+  void _openMatch(Map<String, dynamic> match) {
+    final id      = match[DatabaseHelper.colId]        as int;
+    final teamA   = match[DatabaseHelper.colTeamA]     as String? ?? '';
+    final teamB   = match[DatabaseHelper.colTeamB]     as String? ?? '';
+    final status  = match[DatabaseHelper.colStatus]    as String? ?? '';
+    final creator = match[DatabaseHelper.colCreatedBy] as String?;
+    final userId  = AuthService.instance.userId;
+
+    if (status == 'completed') {
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => ScorecardScreen(matchId: id, teamA: teamA, teamB: teamB),
+        ),
+      ).then((_) => _loadAll());
+    } else if (creator != null && creator == userId) {
+      Navigator.push(
+        context,
+        MaterialPageRoute(builder: (_) => ScoringScreen(matchId: id)),
+      ).then((_) => _loadAll());
+    } else {
+      Navigator.push(
+        context,
+        MaterialPageRoute(
+          builder: (_) => ScorecardScreen(matchId: id, teamA: teamA, teamB: teamB),
+        ),
+      ).then((_) => _loadAll());
+    }
   }
 
   Future<void> _addMatch() async {
     final t = _tournament;
     if (t == null) return;
-
+    final format = t[DatabaseHelper.colFormat] as String? ?? 'league';
     await Navigator.push(
       context,
       MaterialPageRoute(
         builder: (_) => NewMatchScreen(
-          tournamentId: widget.tournamentId,
-          tournamentName: t[DatabaseHelper.colName] as String,
+          tournamentId:     widget.tournamentId,
+          tournamentFormat: format,
         ),
       ),
     );
     if (mounted) _loadAll();
   }
 
-  /// Shows a bottom sheet that lists all teams in the DB, letting the user
-  /// pick one and insert it as a late-entry team into this tournament.
-  /// Also exposes a '+ Create New Team' button to create a brand-new team
-  /// and register it in the tournament in a single transaction.
   Future<void> _addTeamToTournament() async {
-    // Fetch every distinct team name from the players table.
+    final c = Theme.of(context).appColors;
+
     final db = await DatabaseHelper.instance.database;
     final rows = await db.rawQuery(
       'SELECT DISTINCT ${DatabaseHelper.colTeam} FROM ${DatabaseHelper.tablePlayers} '
       'ORDER BY ${DatabaseHelper.colTeam} ASC',
     );
-    final allTeamNames = rows
-        .map((r) => r[DatabaseHelper.colTeam] as String)
-        .toList();
+    final allTeamNames = rows.map((r) => r[DatabaseHelper.colTeam] as String).toList();
 
-    // Also include teams already registered in this tournament so the full
-    // list is available even if players haven't been entered yet.
     final tournamentTeamRows =
         await DatabaseHelper.instance.fetchAllTournamentTeamRows(widget.tournamentId);
     final registeredNames =
         tournamentTeamRows.map((r) => r[DatabaseHelper.colTeamName] as String).toSet();
 
-    // Merge: registered names first, then any extras from players table.
     final merged = <String>{...registeredNames, ...allTeamNames}.toList()..sort();
 
     if (!mounted) return;
@@ -172,11 +193,11 @@ class _TournamentDashboardScreenState extends State<TournamentDashboardScreen>
     String? selected;
     final searchController = TextEditingController();
 
-    // ── Helper: open the "Create New Team" dialog ────────────────────────────
     Future<void> showCreateTeamDialog(
       BuildContext sheetCtx,
       void Function(void Function()) setModalState,
     ) async {
+      final dc = Theme.of(sheetCtx).appColors;
       final newTeamController = TextEditingController();
       String? dialogError;
 
@@ -187,20 +208,16 @@ class _TournamentDashboardScreenState extends State<TournamentDashboardScreen>
           return StatefulBuilder(
             builder: (dialogCtx, setDialogState) {
               return AlertDialog(
-                backgroundColor: _surfaceCard,
-                shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(16)),
+                backgroundColor: dc.card,
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
                 title: Row(
                   children: [
-                    const Icon(Icons.add_circle_outline,
-                        color: _accentGreen, size: 20),
+                    Icon(Icons.add_circle_outline, color: dc.accentGreen, size: 20),
                     const SizedBox(width: 8),
                     Text(
                       'Create New Team',
                       style: GoogleFonts.rajdhani(
-                        fontSize: 17,
-                        fontWeight: FontWeight.w800,
-                        color: _textPrimary,
+                        fontSize: 17, fontWeight: FontWeight.w800, color: dc.textPrimary,
                       ),
                     ),
                   ],
@@ -212,42 +229,33 @@ class _TournamentDashboardScreenState extends State<TournamentDashboardScreen>
                     Text(
                       'Enter a name for the new team. It will be created and '
                       'immediately added to this tournament.',
-                      style: GoogleFonts.rajdhani(
-                          fontSize: 13, color: _textSecondary),
+                      style: GoogleFonts.rajdhani(fontSize: 13, color: dc.textSecondary),
                     ),
                     const SizedBox(height: 14),
                     TextField(
                       controller: newTeamController,
                       autofocus: true,
                       textCapitalization: TextCapitalization.words,
-                      style: GoogleFonts.rajdhani(
-                          fontSize: 15, color: _textPrimary),
+                      style: GoogleFonts.rajdhani(fontSize: 15, color: dc.textPrimary),
                       onChanged: (_) {
-                        if (dialogError != null) {
-                          setDialogState(() => dialogError = null);
-                        }
+                        if (dialogError != null) setDialogState(() => dialogError = null);
                       },
                       decoration: InputDecoration(
                         hintText: 'Team Name',
-                        hintStyle: GoogleFonts.rajdhani(
-                            fontSize: 14, color: _textSecondary),
+                        hintStyle: GoogleFonts.rajdhani(fontSize: 14, color: dc.textSecondary),
                         errorText: dialogError,
-                        errorStyle: GoogleFonts.rajdhani(
-                            fontSize: 12, color: _liveRed),
-                        prefixIcon: const Icon(Icons.group_add,
-                            color: _accentGreenMid, size: 18),
+                        errorStyle: GoogleFonts.rajdhani(fontSize: 12, color: dc.liveRed),
+                        prefixIcon: Icon(Icons.group_add, color: dc.accentGreen, size: 18),
                         filled: true,
-                        fillColor: _surfaceCard2,
-                        contentPadding: const EdgeInsets.symmetric(
-                            horizontal: 12, vertical: 12),
+                        fillColor: dc.card2,
+                        contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
                         border: OutlineInputBorder(
                           borderRadius: BorderRadius.circular(10),
                           borderSide: BorderSide.none,
                         ),
                         focusedBorder: OutlineInputBorder(
                           borderRadius: BorderRadius.circular(10),
-                          borderSide: const BorderSide(
-                              color: _accentGreen, width: 1.5),
+                          borderSide: BorderSide(color: dc.accentGreen, width: 1.5),
                         ),
                       ),
                     ),
@@ -256,58 +264,42 @@ class _TournamentDashboardScreenState extends State<TournamentDashboardScreen>
                 actions: [
                   TextButton(
                     onPressed: () => Navigator.pop(dialogCtx),
-                    child: Text(
-                      'Cancel',
-                      style: GoogleFonts.rajdhani(
-                          fontSize: 14, color: _textSecondary),
-                    ),
+                    child: Text('Cancel',
+                        style: GoogleFonts.rajdhani(fontSize: 14, color: dc.textSecondary)),
                   ),
                   ElevatedButton(
                     style: ElevatedButton.styleFrom(
-                      backgroundColor: _accentGreen,
+                      backgroundColor: dc.accentGreen,
                       foregroundColor: Colors.black,
-                      shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(10)),
+                      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
                     ),
                     onPressed: () async {
                       final name = newTeamController.text.trim();
                       if (name.isEmpty) {
-                        setDialogState(
-                            () => dialogError = 'Team name cannot be empty.');
+                        setDialogState(() => dialogError = 'Team name cannot be empty.');
                         return;
                       }
                       try {
                         await DatabaseHelper.instance
-                            .createTeamAndAddToTournament(
-                                widget.tournamentId, name);
-                        // Close dialog, then close the bottom sheet.
+                            .createTeamAndAddToTournament(widget.tournamentId, name);
                         if (dialogCtx.mounted) Navigator.pop(dialogCtx);
                         if (sheetCtx.mounted) Navigator.pop(sheetCtx);
-                        // Refresh dashboard and show success feedback.
                         if (mounted) {
                           _loadAll();
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            SnackBar(
-                              content: Text(
-                                '$name created and added to the tournament.',
-                                style: GoogleFonts.rajdhani(fontSize: 14),
-                              ),
-                              backgroundColor: _accentGreenMid,
-                            ),
-                          );
+                          ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+                            content: Text('$name created and added to the tournament.',
+                                style: GoogleFonts.rajdhani(fontSize: 14)),
+                            backgroundColor: dc.accentGreen,
+                          ));
                         }
                       } on StateError catch (e) {
                         setDialogState(() => dialogError = e.message);
                       } catch (_) {
-                        setDialogState(() =>
-                            dialogError = 'Something went wrong. Try again.');
+                        setDialogState(() => dialogError = 'Something went wrong. Try again.');
                       }
                     },
-                    child: Text(
-                      'Create & Add',
-                      style: GoogleFonts.rajdhani(
-                          fontSize: 14, fontWeight: FontWeight.w800),
-                    ),
+                    child: Text('Create & Add',
+                        style: GoogleFonts.rajdhani(fontSize: 14, fontWeight: FontWeight.w800)),
                   ),
                 ],
               );
@@ -315,31 +307,30 @@ class _TournamentDashboardScreenState extends State<TournamentDashboardScreen>
           );
         },
       );
+      newTeamController.dispose();
     }
 
     await showModalBottomSheet(
       context: context,
       isScrollControlled: true,
-      backgroundColor: _surfaceCard,
+      backgroundColor: c.card,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
       builder: (ctx) {
+        final bc = Theme.of(ctx).appColors;
         return StatefulBuilder(
           builder: (ctx, setModalState) {
             final filtered = searchController.text.trim().isEmpty
                 ? merged
                 : merged
-                    .where((n) => n
-                        .toLowerCase()
+                    .where((n) => n.toLowerCase()
                         .contains(searchController.text.trim().toLowerCase()))
                     .toList();
 
             return Padding(
               padding: EdgeInsets.only(
-                left: 20,
-                right: 20,
-                top: 20,
+                left: 20, right: 20, top: 20,
                 bottom: MediaQuery.of(ctx).viewInsets.bottom + 20,
               ),
               child: Column(
@@ -348,71 +339,47 @@ class _TournamentDashboardScreenState extends State<TournamentDashboardScreen>
                 children: [
                   Row(
                     children: [
-                      const Icon(Icons.group_add, color: _trophyGold, size: 20),
+                      Icon(Icons.group_add, color: bc.trophyGold, size: 20),
                       const SizedBox(width: 8),
-                      Text(
-                        'Add Team to Tournament',
-                        style: GoogleFonts.rajdhani(
-                          fontSize: 18,
-                          fontWeight: FontWeight.w800,
-                          color: _textPrimary,
-                        ),
-                      ),
+                      Text('Add Team to Tournament',
+                          style: GoogleFonts.rajdhani(
+                              fontSize: 18, fontWeight: FontWeight.w800, color: bc.textPrimary)),
                     ],
                   ),
                   const SizedBox(height: 4),
-                  Text(
-                    'Select an existing team or create a new one.',
-                    style: GoogleFonts.rajdhani(
-                        fontSize: 13, color: _textSecondary),
-                  ),
+                  Text('Select an existing team or create a new one.',
+                      style: GoogleFonts.rajdhani(fontSize: 13, color: bc.textSecondary)),
                   const SizedBox(height: 14),
-                  // Search field inside the sheet
                   TextField(
                     controller: searchController,
-                    style: GoogleFonts.rajdhani(
-                        fontSize: 14, color: _textPrimary),
+                    style: GoogleFonts.rajdhani(fontSize: 14, color: bc.textPrimary),
                     onChanged: (_) => setModalState(() {}),
                     decoration: InputDecoration(
                       hintText: 'Search team…',
-                      hintStyle: GoogleFonts.rajdhani(
-                          fontSize: 14, color: _textSecondary),
-                      prefixIcon: const Icon(Icons.search,
-                          color: _accentGreenMid, size: 18),
+                      hintStyle: GoogleFonts.rajdhani(fontSize: 14, color: bc.textSecondary),
+                      prefixIcon: Icon(Icons.search, color: bc.accentGreen, size: 18),
                       filled: true,
-                      fillColor: _surfaceCard2,
-                      contentPadding: const EdgeInsets.symmetric(
-                          horizontal: 12, vertical: 10),
+                      fillColor: bc.card2,
+                      contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
                       border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(10),
-                        borderSide: BorderSide.none,
-                      ),
+                          borderRadius: BorderRadius.circular(10), borderSide: BorderSide.none),
                     ),
                   ),
                   const SizedBox(height: 10),
-                  // ── Create New Team button ──────────────────────────────
                   SizedBox(
                     width: double.infinity,
                     child: OutlinedButton.icon(
-                      onPressed: () =>
-                          showCreateTeamDialog(ctx, setModalState),
+                      onPressed: () => showCreateTeamDialog(ctx, setModalState),
                       style: OutlinedButton.styleFrom(
-                        foregroundColor: _accentGreen,
-                        side: const BorderSide(
-                            color: _accentGreen, width: 1.2),
-                        shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(10)),
+                        foregroundColor: bc.accentGreen,
+                        side: BorderSide(color: bc.accentGreen, width: 1.2),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
                         padding: const EdgeInsets.symmetric(vertical: 11),
                       ),
                       icon: const Icon(Icons.add, size: 16),
-                      label: Text(
-                        '+ Create New Team',
-                        style: GoogleFonts.rajdhani(
-                          fontSize: 14,
-                          fontWeight: FontWeight.w700,
-                          letterSpacing: 0.4,
-                        ),
-                      ),
+                      label: Text('+ Create New Team',
+                          style: GoogleFonts.rajdhani(
+                              fontSize: 14, fontWeight: FontWeight.w700, letterSpacing: 0.4)),
                     ),
                   ),
                   const SizedBox(height: 10),
@@ -421,8 +388,7 @@ class _TournamentDashboardScreenState extends State<TournamentDashboardScreen>
                       padding: const EdgeInsets.symmetric(vertical: 20),
                       child: Center(
                         child: Text('No teams found.',
-                            style: GoogleFonts.rajdhani(
-                                fontSize: 14, color: _textSecondary)),
+                            style: GoogleFonts.rajdhani(fontSize: 14, color: bc.textSecondary)),
                       ),
                     )
                   else
@@ -438,66 +404,42 @@ class _TournamentDashboardScreenState extends State<TournamentDashboardScreen>
                           return GestureDetector(
                             onTap: () => setModalState(() => selected = name),
                             child: Container(
-                              margin:
-                                  const EdgeInsets.symmetric(vertical: 3),
-                              padding: const EdgeInsets.symmetric(
-                                  horizontal: 14, vertical: 10),
+                              margin: const EdgeInsets.symmetric(vertical: 3),
+                              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
                               decoration: BoxDecoration(
-                                color: isSelected
-                                    ? _trophyGold.withAlpha(30)
-                                    : _surfaceCard2,
+                                color: isSelected ? bc.trophyGold.withAlpha(30) : bc.card2,
                                 borderRadius: BorderRadius.circular(10),
                                 border: Border.all(
-                                  color: isSelected
-                                      ? _trophyGold.withAlpha(120)
-                                      : const Color(0xFF2A2A2A),
+                                  color: isSelected ? bc.trophyGold.withAlpha(120) : bc.border,
                                 ),
                               ),
                               child: Row(
                                 children: [
                                   Icon(
-                                    isSelected
-                                        ? Icons.check_circle
-                                        : Icons.group,
-                                    color: isSelected
-                                        ? _trophyGold
-                                        : _textSecondary,
+                                    isSelected ? Icons.check_circle : Icons.group,
+                                    color: isSelected ? bc.trophyGold : bc.textSecondary,
                                     size: 18,
                                   ),
                                   const SizedBox(width: 10),
                                   Expanded(
-                                    child: Text(
-                                      name,
-                                      style: GoogleFonts.rajdhani(
-                                        fontSize: 15,
-                                        fontWeight: isSelected
-                                            ? FontWeight.w800
-                                            : FontWeight.w600,
-                                        color: isSelected
-                                            ? _trophyGold
-                                            : _textPrimary,
-                                      ),
-                                    ),
+                                    child: Text(name,
+                                        style: GoogleFonts.rajdhani(
+                                          fontSize: 15,
+                                          fontWeight: isSelected ? FontWeight.w800 : FontWeight.w600,
+                                          color: isSelected ? bc.trophyGold : bc.textPrimary,
+                                        )),
                                   ),
                                   if (isRegistered)
                                     Container(
-                                      padding: const EdgeInsets.symmetric(
-                                          horizontal: 6, vertical: 2),
+                                      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                                       decoration: BoxDecoration(
-                                        color:
-                                            _accentGreenMid.withAlpha(25),
-                                        borderRadius:
-                                            BorderRadius.circular(4),
+                                        color: bc.accentGreen.withAlpha(25),
+                                        borderRadius: BorderRadius.circular(4),
                                       ),
-                                      child: Text(
-                                        'REGISTERED',
-                                        style: GoogleFonts.rajdhani(
-                                          fontSize: 9,
-                                          fontWeight: FontWeight.w700,
-                                          color: _accentGreenMid,
-                                          letterSpacing: 1,
-                                        ),
-                                      ),
+                                      child: Text('REGISTERED',
+                                          style: GoogleFonts.rajdhani(
+                                              fontSize: 9, fontWeight: FontWeight.w700,
+                                              color: bc.accentGreen, letterSpacing: 1)),
                                     ),
                                 ],
                               ),
@@ -511,23 +453,16 @@ class _TournamentDashboardScreenState extends State<TournamentDashboardScreen>
                     width: double.infinity,
                     height: 48,
                     child: ElevatedButton.icon(
-                      onPressed: selected == null
-                          ? null
-                          : () => Navigator.pop(ctx, selected),
+                      onPressed: selected == null ? null : () => Navigator.pop(ctx, selected),
                       style: ElevatedButton.styleFrom(
-                        backgroundColor: _trophyGold,
-                        disabledBackgroundColor:
-                            _trophyGold.withAlpha(50),
+                        backgroundColor: bc.trophyGold,
+                        disabledBackgroundColor: bc.trophyGold.withAlpha(50),
                         foregroundColor: Colors.black,
-                        shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(12)),
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                       ),
                       icon: const Icon(Icons.add, size: 18),
-                      label: Text(
-                        'Add to Tournament',
-                        style: GoogleFonts.rajdhani(
-                            fontSize: 15, fontWeight: FontWeight.w800),
-                      ),
+                      label: Text('Add to Tournament',
+                          style: GoogleFonts.rajdhani(fontSize: 15, fontWeight: FontWeight.w800)),
                     ),
                   ),
                 ],
@@ -539,55 +474,47 @@ class _TournamentDashboardScreenState extends State<TournamentDashboardScreen>
     ).then((picked) async {
       if (picked == null || !mounted) return;
       final teamName = picked as String;
-      // Skip if already registered.
       if (registeredNames.contains(teamName)) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              '$teamName is already in this tournament.',
-              style: GoogleFonts.rajdhani(fontSize: 14),
-            ),
-            backgroundColor: _surfaceCard,
-          ),
-        );
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('$teamName is already in this tournament.',
+              style: GoogleFonts.rajdhani(fontSize: 14)),
+          backgroundColor: c.card,
+        ));
         return;
       }
-      await DatabaseHelper.instance
-          .insertTeamIntoTournament(widget.tournamentId, teamName);
+      await DatabaseHelper.instance.insertTeamIntoTournament(widget.tournamentId, teamName);
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text(
-              '$teamName added to the tournament.',
-              style: GoogleFonts.rajdhani(fontSize: 14),
-            ),
-            backgroundColor: _accentGreenMid,
-          ),
-        );
+        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+          content: Text('$teamName added to the tournament.',
+              style: GoogleFonts.rajdhani(fontSize: 14)),
+          backgroundColor: c.accentGreen,
+        ));
         _loadAll();
       }
     });
+    searchController.dispose();
   }
 
   // ── Build ────────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
+    final c = Theme.of(context).appColors;
     if (_loadingMeta) {
       return Scaffold(
-        backgroundColor: _surfaceDark,
-        body: const Center(child: CircularProgressIndicator(color: _accentGreen)),
+        backgroundColor: c.surface,
+        body: Center(child: CircularProgressIndicator(color: c.accentGreen)),
       );
     }
 
     final t = _tournament;
     if (t == null) {
       return Scaffold(
-        backgroundColor: _surfaceDark,
-        appBar: AppBar(backgroundColor: _surfaceDark, foregroundColor: _textPrimary),
+        backgroundColor: c.surface,
+        appBar: AppBar(backgroundColor: c.surface, foregroundColor: c.textPrimary),
         body: Center(
           child: Text('Tournament not found.',
-              style: GoogleFonts.rajdhani(color: _textSecondary, fontSize: 16)),
+              style: GoogleFonts.rajdhani(color: c.textSecondary, fontSize: 16)),
         ),
       );
     }
@@ -597,19 +524,19 @@ class _TournamentDashboardScreenState extends State<TournamentDashboardScreen>
     final status = t[DatabaseHelper.colStatus]  as String? ?? 'active';
 
     return Scaffold(
-      backgroundColor: _surfaceDark,
+      backgroundColor: c.surface,
       body: NestedScrollView(
-        headerSliverBuilder: (context2, _) => [_buildAppBar(name, format, status)],
+        headerSliverBuilder: (context2, _) => [_buildAppBar(context2, name, format, status)],
         body: Column(
           children: [
-            _buildTabBar(),
+            _buildTabBar(c),
             Expanded(
               child: TabBarView(
                 controller: _tabController,
                 children: [
                   _MatchesTab(
                     matches: _matches,
-                    onTapMatch: _openScoring,
+                    onTapMatch: _openMatch,
                     onAddMatch: _addMatch,
                     onAddTeam: _addTeamToTournament,
                     tournamentStatus: status,
@@ -630,19 +557,20 @@ class _TournamentDashboardScreenState extends State<TournamentDashboardScreen>
     );
   }
 
-  Widget _buildAppBar(String name, String format, String status) {
+  Widget _buildAppBar(BuildContext ctx, String name, String format, String status) {
+    final c = Theme.of(ctx).appColors;
     return SliverAppBar(
       expandedHeight: 140,
       pinned: true,
-      backgroundColor: _surfaceDark,
-      foregroundColor: _textPrimary,
+      backgroundColor: c.surface,
+      foregroundColor: c.textPrimary,
       flexibleSpace: FlexibleSpaceBar(
         background: Container(
-          decoration: const BoxDecoration(
+          decoration: BoxDecoration(
             gradient: LinearGradient(
               begin: Alignment.topLeft,
               end: Alignment.bottomRight,
-              colors: [Color(0xFF1A1000), Color(0xFF0A0A0A)],
+              colors: [c.surface, c.card],
             ),
           ),
         ),
@@ -653,19 +581,15 @@ class _TournamentDashboardScreenState extends State<TournamentDashboardScreen>
           children: [
             Row(
               children: [
-                const Icon(Icons.emoji_events, color: _trophyGold, size: 16),
+                Icon(Icons.emoji_events, color: c.trophyGold, size: 16),
                 const SizedBox(width: 6),
                 Expanded(
-                  child: Text(
-                    name,
-                    style: GoogleFonts.rajdhani(
-                      fontSize: 18,
-                      fontWeight: FontWeight.w900,
-                      color: _textPrimary,
-                      letterSpacing: 0.5,
-                    ),
-                    overflow: TextOverflow.ellipsis,
-                  ),
+                  child: Text(name,
+                      style: GoogleFonts.rajdhani(
+                        fontSize: 18, fontWeight: FontWeight.w900,
+                        color: c.textPrimary, letterSpacing: 0.5,
+                      ),
+                      overflow: TextOverflow.ellipsis),
                 ),
               ],
             ),
@@ -683,15 +607,15 @@ class _TournamentDashboardScreenState extends State<TournamentDashboardScreen>
     );
   }
 
-  Widget _buildTabBar() {
+  Widget _buildTabBar(AppColors c) {
     return Container(
-      color: _surfaceDark,
+      color: c.surface,
       child: TabBar(
         controller: _tabController,
-        indicatorColor: _trophyGold,
+        indicatorColor: c.trophyGold,
         indicatorWeight: 2.5,
-        labelColor: _trophyGold,
-        unselectedLabelColor: _textSecondary,
+        labelColor: c.trophyGold,
+        unselectedLabelColor: c.textSecondary,
         labelStyle: GoogleFonts.rajdhani(fontSize: 13, fontWeight: FontWeight.w800, letterSpacing: 1.5),
         unselectedLabelStyle: GoogleFonts.rajdhani(fontSize: 13, fontWeight: FontWeight.w600),
         tabs: const [
@@ -719,7 +643,7 @@ class _MatchesTab extends StatelessWidget {
   });
 
   final List<Map<String, dynamic>> matches;
-  final void Function(int matchId) onTapMatch;
+  final void Function(Map<String, dynamic> match) onTapMatch;
   final VoidCallback onAddMatch;
   final VoidCallback onAddTeam;
   final String tournamentStatus;
@@ -728,17 +652,13 @@ class _MatchesTab extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final c = Theme.of(context).appColors;
     final isCompleted = tournamentStatus == 'completed';
 
-    // Resolve winner name for the champions banner.
-    // Prefer the pre-resolved name passed from the parent state (looked up from
-    // tournament_teams by winner_team_id).  Fall back to scanning the matches
-    // list for a completed Final result string.
     String? winnerName = resolvedWinnerName;
     if (winnerName == null) {
       final winnerTeamId = tournament[DatabaseHelper.colWinnerTeamId];
       if (winnerTeamId == null) {
-        // Fallback: scan matches for a completed Final
         final finalMatch = matches.firstWhere(
           (m) =>
               m[DatabaseHelper.colMatchStage] == 'Final' &&
@@ -748,7 +668,6 @@ class _MatchesTab extends StatelessWidget {
         if (finalMatch.isNotEmpty) {
           final rawWinner = finalMatch[DatabaseHelper.colWinner] as String?;
           if (rawWinner != null && rawWinner.isNotEmpty) {
-            // rawWinner is "TeamName won by X runs/wickets"
             final teamA = finalMatch[DatabaseHelper.colTeamA] as String? ?? '';
             final teamB = finalMatch[DatabaseHelper.colTeamB] as String? ?? '';
             final lower = rawWinner.toLowerCase();
@@ -766,55 +685,69 @@ class _MatchesTab extends StatelessWidget {
         .where((m) =>
             m[DatabaseHelper.colStatus] == 'live' ||
             m[DatabaseHelper.colStatus] == 'pending')
-        .toList();
+        .toList()
+      ..sort((a, b) {
+        final ca = a[DatabaseHelper.colCreatedAt] as String?;
+        final cb = b[DatabaseHelper.colCreatedAt] as String?;
+        if (ca == null && cb == null) return 0;
+        if (ca == null) return 1;
+        if (cb == null) return -1;
+        try { return DateTime.parse(cb).compareTo(DateTime.parse(ca)); }
+        catch (_) { return 0; }
+      });
     final done = matches
         .where((m) => m[DatabaseHelper.colStatus] == 'completed')
-        .toList();
+        .toList()
+      ..sort((a, b) {
+        final ca = a[DatabaseHelper.colCreatedAt] as String?;
+        final cb = b[DatabaseHelper.colCreatedAt] as String?;
+        if (ca == null && cb == null) return 0;
+        if (ca == null) return 1;
+        if (cb == null) return -1;
+        try { return DateTime.parse(cb).compareTo(DateTime.parse(ca)); }
+        catch (_) { return 0; }
+      });
 
     return ListView(
       padding: const EdgeInsets.fromLTRB(16, 16, 16, 110),
       children: [
-        // Champions banner — only when tournament is completed
         if (isCompleted) ...[
           _ChampionsBanner(winnerName: winnerName),
           const SizedBox(height: 16),
         ],
-
-        // Add Match button — hidden when tournament is completed
         if (!isCompleted) ...[
           _AddMatchButton(onTap: onAddMatch),
           const SizedBox(height: 10),
           _AddTeamButton(onTap: onAddTeam),
           const SizedBox(height: 20),
         ],
-
         if (matches.isEmpty) ...[
           const SizedBox(height: 40),
           Center(
             child: Column(
               children: [
-                Icon(Icons.sports_cricket, size: 64, color: _trophyGold.withAlpha(60)),
+                Icon(Icons.sports_cricket, size: 64, color: c.trophyGold.withAlpha(60)),
                 const SizedBox(height: 16),
                 Text('No Matches Yet',
                     style: GoogleFonts.rajdhani(
-                        fontSize: 20, fontWeight: FontWeight.w700, color: _textSecondary)),
+                        fontSize: 20, fontWeight: FontWeight.w700, color: c.textSecondary)),
                 const SizedBox(height: 8),
                 Text('Tap "Add Match" to start playing.',
-                    style: GoogleFonts.rajdhani(fontSize: 14, color: _textSecondary)),
+                    style: GoogleFonts.rajdhani(fontSize: 14, color: c.textSecondary)),
               ],
             ),
           ),
         ] else ...[
           if (live.isNotEmpty) ...[
-            _SectionHeader('ACTIVE', _liveRed),
+            _SectionHeader('ACTIVE', c.liveRed),
             const SizedBox(height: 10),
-            ...live.map((m) => _MatchCard(match: m, onTap: () => onTapMatch(m[DatabaseHelper.colId] as int), context: context)),
+            ...live.map((m) => _MatchCard(match: m, onTap: () => onTapMatch(m), context: context)),
             const SizedBox(height: 20),
           ],
           if (done.isNotEmpty) ...[
-            _SectionHeader('COMPLETED', _completedBlue),
+            _SectionHeader('COMPLETED', c.completedBlue),
             const SizedBox(height: 10),
-            ...done.map((m) => _MatchCard(match: m, onTap: () => onTapMatch(m[DatabaseHelper.colId] as int), context: context)),
+            ...done.map((m) => _MatchCard(match: m, onTap: () => onTapMatch(m), context: context)),
           ],
         ],
       ],
@@ -828,6 +761,7 @@ class _ChampionsBanner extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final c = Theme.of(context).appColors;
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
       decoration: BoxDecoration(
@@ -837,51 +771,35 @@ class _ChampionsBanner extends StatelessWidget {
           colors: [Color(0xFF2A1E00), Color(0xFF1C1200)],
         ),
         borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: _trophyGold.withAlpha(120), width: 1.5),
+        border: Border.all(color: c.trophyGold.withAlpha(120), width: 1.5),
         boxShadow: [
-          BoxShadow(
-            color: _trophyGold.withAlpha(40),
-            blurRadius: 16,
-            spreadRadius: 2,
-          ),
+          BoxShadow(color: c.trophyGold.withAlpha(40), blurRadius: 16, spreadRadius: 2),
         ],
       ),
       child: Row(
         children: [
           Container(
-            width: 48,
-            height: 48,
+            width: 48, height: 48,
             decoration: BoxDecoration(
-              color: _trophyGold.withAlpha(30),
-              shape: BoxShape.circle,
+              color: c.trophyGold.withAlpha(30), shape: BoxShape.circle,
             ),
-            child: const Icon(Icons.emoji_events, color: _trophyGold, size: 28),
+            child: Icon(Icons.emoji_events, color: c.trophyGold, size: 28),
           ),
           const SizedBox(width: 14),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(
-                  'TOURNAMENT CHAMPION',
-                  style: GoogleFonts.rajdhani(
-                    fontSize: 11,
-                    fontWeight: FontWeight.w800,
-                    color: _trophyGold,
-                    letterSpacing: 2,
-                  ),
-                ),
+                Text('TOURNAMENT CHAMPION',
+                    style: GoogleFonts.rajdhani(
+                        fontSize: 11, fontWeight: FontWeight.w800,
+                        color: c.trophyGold, letterSpacing: 2)),
                 const SizedBox(height: 2),
-                Text(
-                  winnerName ?? 'Champion',
-                  style: GoogleFonts.rajdhani(
-                    fontSize: 20,
-                    fontWeight: FontWeight.w900,
-                    color: _textPrimary,
-                    letterSpacing: 0.5,
-                  ),
-                  overflow: TextOverflow.ellipsis,
-                ),
+                Text(winnerName ?? 'Champion',
+                    style: GoogleFonts.rajdhani(
+                        fontSize: 20, fontWeight: FontWeight.w900,
+                        color: c.textPrimary, letterSpacing: 0.5),
+                    overflow: TextOverflow.ellipsis),
               ],
             ),
           ),
@@ -897,23 +815,21 @@ class _AddMatchButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final c = Theme.of(context).appColors;
     return SizedBox(
       height: 50,
       child: ElevatedButton.icon(
         onPressed: onTap,
         style: ElevatedButton.styleFrom(
-          backgroundColor: _trophyGold,
+          backgroundColor: c.trophyGold,
           foregroundColor: Colors.black,
           elevation: 8,
-          shadowColor: _trophyGold.withAlpha(80),
+          shadowColor: c.trophyGold.withAlpha(80),
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
         ),
         icon: const Icon(Icons.add, size: 20),
-        label: Text(
-          'Add Match',
-          style: GoogleFonts.rajdhani(
-              fontSize: 16, fontWeight: FontWeight.w800, letterSpacing: 1),
-        ),
+        label: Text('Add Match',
+            style: GoogleFonts.rajdhani(fontSize: 16, fontWeight: FontWeight.w800, letterSpacing: 1)),
       ),
     );
   }
@@ -925,22 +841,19 @@ class _AddTeamButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final c = Theme.of(context).appColors;
     return SizedBox(
       height: 46,
       child: OutlinedButton.icon(
         onPressed: onTap,
         style: OutlinedButton.styleFrom(
-          foregroundColor: _trophyGold,
-          side: BorderSide(color: _trophyGold.withAlpha(140), width: 1.5),
-          shape:
-              RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          foregroundColor: c.trophyGold,
+          side: BorderSide(color: c.trophyGold.withAlpha(140), width: 1.5),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
         ),
         icon: const Icon(Icons.group_add, size: 18),
-        label: Text(
-          'Add Late-Entry Team',
-          style: GoogleFonts.rajdhani(
-              fontSize: 15, fontWeight: FontWeight.w700, letterSpacing: 0.5),
-        ),
+        label: Text('Add Late-Entry Team',
+            style: GoogleFonts.rajdhani(fontSize: 15, fontWeight: FontWeight.w700, letterSpacing: 0.5)),
       ),
     );
   }
@@ -953,6 +866,7 @@ class _SectionHeader extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final c = Theme.of(context).appColors;
     return Row(
       children: [
         Container(
@@ -963,7 +877,7 @@ class _SectionHeader extends StatelessWidget {
         Text(title,
             style: GoogleFonts.rajdhani(
                 fontSize: 11, fontWeight: FontWeight.w700,
-                color: _textSecondary, letterSpacing: 2.5)),
+                color: c.textSecondary, letterSpacing: 2.5)),
       ],
     );
   }
@@ -977,6 +891,7 @@ class _MatchCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext ctx) {
+    final c = Theme.of(ctx).appColors;
     final id     = match[DatabaseHelper.colId]         as int;
     final teamA  = match[DatabaseHelper.colTeamA]      as String;
     final teamB  = match[DatabaseHelper.colTeamB]      as String;
@@ -998,7 +913,7 @@ class _MatchCard extends StatelessWidget {
                   const Spacer(),
                   if (created != null)
                     Text(_relDate(created),
-                        style: GoogleFonts.rajdhani(fontSize: 11, color: _textSecondary)),
+                        style: GoogleFonts.rajdhani(fontSize: 11, color: c.textSecondary)),
                 ],
               ),
               const SizedBox(height: 12),
@@ -1007,7 +922,7 @@ class _MatchCard extends StatelessWidget {
                   Expanded(
                     child: Text(teamA,
                         style: GoogleFonts.rajdhani(
-                            fontSize: 17, fontWeight: FontWeight.w800, color: _textPrimary),
+                            fontSize: 17, fontWeight: FontWeight.w800, color: c.textPrimary),
                         overflow: TextOverflow.ellipsis),
                   ),
                   Padding(
@@ -1015,13 +930,13 @@ class _MatchCard extends StatelessWidget {
                     child: Text('VS',
                         style: GoogleFonts.rajdhani(
                             fontSize: 12, fontWeight: FontWeight.w900,
-                            color: _trophyGold, letterSpacing: 2)),
+                            color: c.trophyGold, letterSpacing: 2)),
                   ),
                   Expanded(
                     child: Text(teamB,
                         textAlign: TextAlign.right,
                         style: GoogleFonts.rajdhani(
-                            fontSize: 17, fontWeight: FontWeight.w800, color: _textPrimary),
+                            fontSize: 17, fontWeight: FontWeight.w800, color: c.textPrimary),
                         overflow: TextOverflow.ellipsis),
                   ),
                 ],
@@ -1029,11 +944,11 @@ class _MatchCard extends StatelessWidget {
               const SizedBox(height: 10),
               Row(
                 children: [
-                  const Icon(Icons.timer_outlined, size: 13, color: _textSecondary),
+                  Icon(Icons.timer_outlined, size: 13, color: c.textSecondary),
                   const SizedBox(width: 4),
                   Text('$overs overs',
                       style: GoogleFonts.rajdhani(
-                          fontSize: 12, color: _textSecondary, fontWeight: FontWeight.w600)),
+                          fontSize: 12, color: c.textSecondary, fontWeight: FontWeight.w600)),
                   const Spacer(),
                   if (status == 'completed')
                     GestureDetector(
@@ -1043,22 +958,22 @@ class _MatchCard extends StatelessWidget {
                       child: Container(
                         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                         decoration: BoxDecoration(
-                          color: _completedBlue.withAlpha(25),
+                          color: c.completedBlue.withAlpha(25),
                           borderRadius: BorderRadius.circular(6),
-                          border: Border.all(color: _completedBlue.withAlpha(70)),
+                          border: Border.all(color: c.completedBlue.withAlpha(70)),
                         ),
                         child: Row(mainAxisSize: MainAxisSize.min, children: [
-                          const Icon(Icons.bar_chart, size: 12, color: _completedBlue),
+                          Icon(Icons.bar_chart, size: 12, color: c.completedBlue),
                           const SizedBox(width: 4),
                           Text('Summary',
                               style: GoogleFonts.rajdhani(
-                                  fontSize: 11, fontWeight: FontWeight.w700, color: _completedBlue)),
+                                  fontSize: 11, fontWeight: FontWeight.w700, color: c.completedBlue)),
                         ]),
                       ),
                     ),
                   const SizedBox(width: 8),
                   Icon(Icons.arrow_forward_ios,
-                      size: 12, color: status == 'completed' ? _trophyGold : _accentGreen),
+                      size: 12, color: status == 'completed' ? c.trophyGold : c.accentGreen),
                 ],
               ),
             ],
@@ -1097,8 +1012,9 @@ class _PointsTableTab extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final c = Theme.of(context).appColors;
     if (loading) {
-      return const Center(child: CircularProgressIndicator(color: _accentGreen));
+      return Center(child: CircularProgressIndicator(color: c.accentGreen));
     }
 
     if (standings.isEmpty) {
@@ -1106,22 +1022,22 @@ class _PointsTableTab extends StatelessWidget {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Icon(Icons.table_chart_outlined, size: 64, color: _trophyGold.withAlpha(60)),
+            Icon(Icons.table_chart_outlined, size: 64, color: c.trophyGold.withAlpha(60)),
             const SizedBox(height: 16),
             Text('No completed matches yet.',
                 style: GoogleFonts.rajdhani(
-                    fontSize: 18, fontWeight: FontWeight.w700, color: _textSecondary)),
+                    fontSize: 18, fontWeight: FontWeight.w700, color: c.textSecondary)),
             const SizedBox(height: 8),
             Text('Points table will appear after matches complete.',
-                style: GoogleFonts.rajdhani(fontSize: 13, color: _textSecondary),
+                style: GoogleFonts.rajdhani(fontSize: 13, color: c.textSecondary),
                 textAlign: TextAlign.center),
             const SizedBox(height: 24),
             TextButton.icon(
               onPressed: onRefresh,
-              icon: const Icon(Icons.refresh, color: _trophyGold),
+              icon: Icon(Icons.refresh, color: c.trophyGold),
               label: Text('Refresh',
                   style: GoogleFonts.rajdhani(
-                      color: _trophyGold, fontWeight: FontWeight.w700, fontSize: 15)),
+                      color: c.trophyGold, fontWeight: FontWeight.w700, fontSize: 15)),
             ),
           ],
         ),
@@ -1131,7 +1047,6 @@ class _PointsTableTab extends StatelessWidget {
     return ListView(
       padding: const EdgeInsets.fromLTRB(16, 16, 16, 40),
       children: [
-        // Refresh row
         Row(
           mainAxisAlignment: MainAxisAlignment.end,
           children: [
@@ -1139,31 +1054,24 @@ class _PointsTableTab extends StatelessWidget {
               onTap: onRefresh,
               child: Row(
                 children: [
-                  const Icon(Icons.refresh, size: 14, color: _textSecondary),
+                  Icon(Icons.refresh, size: 14, color: c.textSecondary),
                   const SizedBox(width: 4),
                   Text('Refresh',
                       style: GoogleFonts.rajdhani(
-                          fontSize: 12, color: _textSecondary, fontWeight: FontWeight.w600)),
+                          fontSize: 12, color: c.textSecondary, fontWeight: FontWeight.w600)),
                 ],
               ),
             ),
           ],
         ),
         const SizedBox(height: 10),
-
-        // Leader card
         _LeaderCard(standings.first),
         const SizedBox(height: 20),
-
-        // Table header
         _TableHeader(),
         const SizedBox(height: 6),
-
-        // Rows
         ...standings.asMap().entries.map(
           (e) => _StandingRow(standing: e.value, position: e.key + 1, isLeader: e.key == 0),
         ),
-
         const SizedBox(height: 20),
         _NrrExplanation(),
       ],
@@ -1177,6 +1085,7 @@ class _LeaderCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final c = Theme.of(context).appColors;
     return ClipRRect(
       borderRadius: BorderRadius.circular(16),
       child: BackdropFilter(
@@ -1187,15 +1096,12 @@ class _LeaderCard extends StatelessWidget {
             gradient: LinearGradient(
               begin: Alignment.topLeft,
               end: Alignment.bottomRight,
-              colors: [
-                _trophyGold.withAlpha(40),
-                _trophyGold.withAlpha(10),
-              ],
+              colors: [c.trophyGold.withAlpha(40), c.trophyGold.withAlpha(10)],
             ),
             borderRadius: BorderRadius.circular(16),
-            border: Border.all(color: _trophyGold.withAlpha(80), width: 1.5),
+            border: Border.all(color: c.trophyGold.withAlpha(80), width: 1.5),
             boxShadow: [
-              BoxShadow(color: _trophyGold.withAlpha(20), blurRadius: 20, offset: const Offset(0, 6)),
+              BoxShadow(color: c.trophyGold.withAlpha(20), blurRadius: 20, offset: const Offset(0, 6)),
             ],
           ),
           child: Row(
@@ -1203,11 +1109,11 @@ class _LeaderCard extends StatelessWidget {
               Container(
                 width: 44, height: 44,
                 decoration: BoxDecoration(
-                  color: _trophyGold.withAlpha(30),
+                  color: c.trophyGold.withAlpha(30),
                   shape: BoxShape.circle,
-                  border: Border.all(color: _trophyGold.withAlpha(100)),
+                  border: Border.all(color: c.trophyGold.withAlpha(100)),
                 ),
-                child: const Icon(Icons.emoji_events, color: _trophyGold, size: 22),
+                child: Icon(Icons.emoji_events, color: c.trophyGold, size: 22),
               ),
               const SizedBox(width: 14),
               Expanded(
@@ -1217,10 +1123,10 @@ class _LeaderCard extends StatelessWidget {
                     Text('LEADING',
                         style: GoogleFonts.rajdhani(
                             fontSize: 10, fontWeight: FontWeight.w700,
-                            color: _trophyGold, letterSpacing: 2.5)),
+                            color: c.trophyGold, letterSpacing: 2.5)),
                     Text(standing.teamName,
                         style: GoogleFonts.rajdhani(
-                            fontSize: 22, fontWeight: FontWeight.w900, color: _textPrimary),
+                            fontSize: 22, fontWeight: FontWeight.w900, color: c.textPrimary),
                         overflow: TextOverflow.ellipsis),
                   ],
                 ),
@@ -1230,11 +1136,10 @@ class _LeaderCard extends StatelessWidget {
                 children: [
                   Text('${standing.points}',
                       style: GoogleFonts.rajdhani(
-                          fontSize: 36, fontWeight: FontWeight.w900, color: _trophyGold,
-                          height: 1)),
+                          fontSize: 36, fontWeight: FontWeight.w900, color: c.trophyGold, height: 1)),
                   Text('pts',
                       style: GoogleFonts.rajdhani(
-                          fontSize: 11, color: _trophyGold, fontWeight: FontWeight.w600)),
+                          fontSize: 11, color: c.trophyGold, fontWeight: FontWeight.w600)),
                 ],
               ),
             ],
@@ -1248,47 +1153,48 @@ class _LeaderCard extends StatelessWidget {
 class _TableHeader extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
+    final c = Theme.of(context).appColors;
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
       decoration: BoxDecoration(
-        color: _surfaceCard2,
+        color: c.card2,
         borderRadius: BorderRadius.circular(8),
-        border: Border.all(color: const Color(0xFF2A2A2A)),
+        border: Border.all(color: c.border),
       ),
       child: Row(
         children: [
           SizedBox(
             width: 28,
-            child: Text('#', style: _headerStyle()),
+            child: Text('#', style: _headerStyle(c.textSecondary)),
           ),
-          Expanded(
-            child: Text('TEAM', style: _headerStyle()),
-          ),
+          Expanded(child: Text('TEAM', style: _headerStyle(c.textSecondary))),
           _HeaderCell('P'),
           _HeaderCell('W'),
           _HeaderCell('L'),
           _HeaderCell('T'),
           _HeaderCell('NR'),
-          _HeaderCell('PTS', color: _trophyGold),
+          _HeaderCell('PTS', isGold: true),
           _HeaderCell('NRR', width: 58),
         ],
       ),
     );
   }
 
-  TextStyle _headerStyle({Color color = _textSecondary}) => GoogleFonts.rajdhani(
+  TextStyle _headerStyle(Color color) => GoogleFonts.rajdhani(
     fontSize: 11, fontWeight: FontWeight.w700, color: color, letterSpacing: 1.5,
   );
 }
 
 class _HeaderCell extends StatelessWidget {
-  const _HeaderCell(this.label, {this.color = _textSecondary, this.width = 28});
+  const _HeaderCell(this.label, {this.isGold = false, this.width = 28});
   final String label;
-  final Color color;
+  final bool isGold;
   final double width;
 
   @override
   Widget build(BuildContext context) {
+    final c = Theme.of(context).appColors;
+    final color = isGold ? c.trophyGold : c.textSecondary;
     return SizedBox(
       width: width,
       child: Text(label,
@@ -1311,18 +1217,15 @@ class _StandingRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final c = Theme.of(context).appColors;
     return Container(
       margin: const EdgeInsets.only(bottom: 4),
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
       decoration: BoxDecoration(
-        color: isLeader
-            ? _trophyGold.withAlpha(12)
-            : _surfaceCard.withAlpha(200),
+        color: isLeader ? c.trophyGold.withAlpha(12) : c.card.withAlpha(200),
         borderRadius: BorderRadius.circular(8),
         border: Border.all(
-          color: isLeader
-              ? _trophyGold.withAlpha(50)
-              : const Color(0xFF1E1E1E),
+          color: isLeader ? c.trophyGold.withAlpha(50) : c.border,
         ),
       ),
       child: Row(
@@ -1330,10 +1233,10 @@ class _StandingRow extends StatelessWidget {
           SizedBox(
             width: 28,
             child: isLeader
-                ? const Icon(Icons.emoji_events, size: 14, color: _trophyGold)
+                ? Icon(Icons.emoji_events, size: 14, color: c.trophyGold)
                 : Text('$position',
                     style: GoogleFonts.rajdhani(
-                        fontSize: 13, color: _textSecondary, fontWeight: FontWeight.w700)),
+                        fontSize: 13, color: c.textSecondary, fontWeight: FontWeight.w700)),
           ),
           Expanded(
             child: InkWell(
@@ -1349,23 +1252,22 @@ class _StandingRow extends StatelessWidget {
                 style: GoogleFonts.rajdhani(
                     fontSize: 14,
                     fontWeight: isLeader ? FontWeight.w800 : FontWeight.w600,
-                    color: isLeader ? _trophyGold : _accentGreenMid,
+                    color: isLeader ? c.trophyGold : c.accentGreen,
                     decoration: TextDecoration.underline,
-                    decorationColor: isLeader ? _trophyGold.withAlpha(80) : _accentGreenMid.withAlpha(80)),
+                    decorationColor: isLeader ? c.trophyGold.withAlpha(80) : c.accentGreen.withAlpha(80)),
                 overflow: TextOverflow.ellipsis,
               ),
             ),
           ),
           _DataCell('${standing.played}'),
-          _DataCell('${standing.won}', color: standing.won > 0 ? _accentGreenMid : null),
-          _DataCell('${standing.lost}', color: standing.lost > 0 ? _liveRed.withAlpha(200) : null),
+          _DataCell('${standing.won}', color: standing.won > 0 ? c.accentGreen : null),
+          _DataCell('${standing.lost}', color: standing.lost > 0 ? c.liveRed.withAlpha(200) : null),
           _DataCell('${standing.tied}'),
           _DataCell('${standing.noResult}'),
-          _DataCell('${standing.points}',
-              bold: true, color: isLeader ? _trophyGold : _textPrimary),
+          _DataCell('${standing.points}', bold: true, color: isLeader ? c.trophyGold : c.textPrimary),
           _DataCell(standing.nrrDisplay,
               width: 58,
-              color: standing.nrr >= 0 ? _accentGreenMid : _liveRed.withAlpha(200)),
+              color: standing.nrr >= 0 ? c.accentGreen : c.liveRed.withAlpha(200)),
         ],
       ),
     );
@@ -1381,6 +1283,7 @@ class _DataCell extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final c = Theme.of(context).appColors;
     return SizedBox(
       width: width,
       child: Text(value,
@@ -1388,7 +1291,7 @@ class _DataCell extends StatelessWidget {
           style: GoogleFonts.rajdhani(
               fontSize: 13,
               fontWeight: bold ? FontWeight.w800 : FontWeight.w600,
-              color: color ?? _textSecondary)),
+              color: color ?? c.textSecondary)),
     );
   }
 }
@@ -1396,12 +1299,13 @@ class _DataCell extends StatelessWidget {
 class _NrrExplanation extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
+    final c = Theme.of(context).appColors;
     return Container(
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
-        color: _surfaceCard2,
+        color: c.card2,
         borderRadius: BorderRadius.circular(10),
-        border: Border.all(color: const Color(0xFF2A2A2A)),
+        border: Border.all(color: c.border),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1409,13 +1313,12 @@ class _NrrExplanation extends StatelessWidget {
           Text('NET RUN RATE (NRR)',
               style: GoogleFonts.rajdhani(
                   fontSize: 11, fontWeight: FontWeight.w700,
-                  color: _textSecondary, letterSpacing: 2)),
+                  color: c.textSecondary, letterSpacing: 2)),
           const SizedBox(height: 6),
           Text(
             'NRR = (Runs Scored ÷ Overs Faced) − (Runs Conceded ÷ Overs Bowled)\n'
             'All-out innings: actual overs faced. Full-over innings: max overs.',
-            style: GoogleFonts.rajdhani(
-                fontSize: 12, color: _textSecondary, height: 1.5),
+            style: GoogleFonts.rajdhani(fontSize: 12, color: c.textSecondary, height: 1.5),
           ),
         ],
       ),
@@ -1433,6 +1336,7 @@ class _TourneyCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final c = Theme.of(context).appColors;
     return ClipRRect(
       borderRadius: BorderRadius.circular(14),
       child: BackdropFilter(
@@ -1440,11 +1344,11 @@ class _TourneyCard extends StatelessWidget {
         child: Container(
           padding: const EdgeInsets.all(16),
           decoration: BoxDecoration(
-            color: _surfaceCard.withAlpha(230),
+            color: c.card.withAlpha(230),
             borderRadius: BorderRadius.circular(14),
-            border: Border.all(color: _trophyGold.withAlpha(35), width: 1),
+            border: Border.all(color: c.trophyGold.withAlpha(35), width: 1),
             boxShadow: [
-              BoxShadow(color: _trophyGold.withAlpha(12), blurRadius: 12, offset: const Offset(0, 4)),
+              BoxShadow(color: c.trophyGold.withAlpha(12), blurRadius: 12, offset: const Offset(0, 4)),
             ],
           ),
           child: child,
@@ -1460,15 +1364,16 @@ class _StatusBadge extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final c = Theme.of(context).appColors;
     Color bg, fg;
     String label;
     switch (status) {
       case 'live':
-        bg = _liveRed.withAlpha(30); fg = _liveRed; label = 'LIVE'; break;
+        bg = c.liveRed.withAlpha(30); fg = c.liveRed; label = 'LIVE'; break;
       case 'completed':
-        bg = _completedBlue.withAlpha(30); fg = _completedBlue; label = 'COMPLETED'; break;
+        bg = c.completedBlue.withAlpha(30); fg = c.completedBlue; label = 'COMPLETED'; break;
       default:
-        bg = _accentGreen.withAlpha(20); fg = _accentGreen; label = 'PENDING';
+        bg = c.accentGreen.withAlpha(20); fg = c.accentGreen; label = 'PENDING';
     }
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
@@ -1484,8 +1389,8 @@ class _StatusBadge extends StatelessWidget {
               width: 5, height: 5,
               margin: const EdgeInsets.only(right: 5),
               decoration: BoxDecoration(
-                color: _liveRed, shape: BoxShape.circle,
-                boxShadow: [BoxShadow(color: _liveRed.withAlpha(140), blurRadius: 4)],
+                color: c.liveRed, shape: BoxShape.circle,
+                boxShadow: [BoxShadow(color: c.liveRed.withAlpha(140), blurRadius: 4)],
               ),
             ),
           ],
@@ -1504,16 +1409,17 @@ class _FormatBadge extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final c = Theme.of(context).appColors;
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
       decoration: BoxDecoration(
-        color: _trophyGold.withAlpha(20),
+        color: c.trophyGold.withAlpha(20),
         borderRadius: BorderRadius.circular(5),
       ),
       child: Text(format,
           style: GoogleFonts.rajdhani(
               fontSize: 9, fontWeight: FontWeight.w700,
-              color: _trophyGold, letterSpacing: 1.5)),
+              color: c.trophyGold, letterSpacing: 1.5)),
     );
   }
 }
@@ -1524,18 +1430,19 @@ class _TournamentStatusBadge extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final c = Theme.of(context).appColors;
     final isActive = status == 'active';
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
       decoration: BoxDecoration(
-        color: isActive ? _accentGreen.withAlpha(20) : _completedBlue.withAlpha(20),
+        color: isActive ? c.accentGreen.withAlpha(20) : c.completedBlue.withAlpha(20),
         borderRadius: BorderRadius.circular(5),
       ),
       child: Text(
         isActive ? 'ACTIVE' : 'COMPLETED',
         style: GoogleFonts.rajdhani(
             fontSize: 9, fontWeight: FontWeight.w700,
-            color: isActive ? _accentGreen : _completedBlue, letterSpacing: 1.5),
+            color: isActive ? c.accentGreen : c.completedBlue, letterSpacing: 1.5),
       ),
     );
   }

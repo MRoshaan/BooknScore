@@ -1,26 +1,26 @@
+import 'dart:async';
 import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:fl_chart/fl_chart.dart';
 
+import '../services/auth_service.dart';
 import '../services/database_helper.dart';
-
-// ── Brand Palette ────────────────────────────────────────────────────────────
-const Color _primaryGreen   = Color(0xFF1B5E20);
-const Color _accentGreen    = Color(0xFF4CAF50);
-const Color _surfaceDark    = Color(0xFF0A0A0A);
-const Color _glassBg        = Color(0x1A4CAF50);
-const Color _glassBorder    = Color(0x334CAF50);
-const Color _textPrimary    = Colors.white;
-const Color _textSecondary  = Color(0xFFB0B0B0);
+import '../services/sync_service.dart';
+import '../theme.dart';
 
 /// Player Analytics Screen
 /// Displays:
 ///  • Top Scorers Manhattan chart (BarChart)
 ///  • Bowlers Economy chart (BarChart)
 ///  • Career stats cards for all players
+///
+/// [userOnly] — when true (default), only shows stats for the current user's
+/// players. When false, shows stats for all players in the local DB.
 class AnalyticsScreen extends StatefulWidget {
-  const AnalyticsScreen({super.key});
+  const AnalyticsScreen({super.key, this.userOnly = true});
+
+  final bool userOnly;
 
   @override
   State<AnalyticsScreen> createState() => _AnalyticsScreenState();
@@ -31,30 +31,63 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
   List<Map<String, dynamic>> _playerStats = [];
   List<Map<String, dynamic>> _filteredStats = [];
   bool _loading = true;
+  bool _syncing = false;
+  StreamSubscription<SyncState>? _syncSub;
   String _sortBy = 'runs'; // 'runs', 'average', 'strike_rate', 'wickets', 'economy'
   bool _ascending = false;
 
   final TextEditingController _searchController = TextEditingController();
   String _searchQuery = '';
+  Timer? _searchDebounce;
 
   @override
   void initState() {
     super.initState();
-    _loadPlayerStats();
     _searchController.addListener(_onSearchChanged);
+    // Reload whenever a sync completes so freshly downloaded stats appear.
+    _syncSub = SyncService.instance.syncStatusStream.listen((state) {
+      if (state == SyncState.synced || state == SyncState.error) {
+        _loadPlayerStats();
+      }
+    });
+    // Only load local user stats — no global sync on init.
+    // For global view, sync first to get all community data.
+    if (widget.userOnly) {
+      _loadPlayerStats();
+    } else {
+      _syncAndLoad();
+    }
   }
 
   @override
   void dispose() {
+    _syncSub?.cancel();
+    _searchDebounce?.cancel();
     _searchController.dispose();
     super.dispose();
   }
 
+  /// Trigger a global downward sync then recompute stats from local SQLite.
+  Future<void> _syncAndLoad() async {
+    if (mounted) setState(() => _syncing = true);
+    try {
+      await SyncService.instance.syncDownInitialData(force: true);
+    } finally {
+      if (mounted) setState(() => _syncing = false);
+      await _loadPlayerStats();
+    }
+  }
+
   void _onSearchChanged() {
-    final q = _searchController.text.trim().toLowerCase();
-    setState(() {
-      _searchQuery = q;
-      _applyFilter();
+    _searchDebounce?.cancel();
+    _searchDebounce = Timer(const Duration(milliseconds: 200), () {
+      if (mounted) {
+        final q = _searchController.text.trim().toLowerCase();
+        setState(() {
+          _searchQuery = q;
+          _applyFilter();
+        });
+      }
     });
   }
 
@@ -76,9 +109,53 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
     try {
       final db = await _db.database;
       
-      // Get all unique players
-      final players = await db.query(DatabaseHelper.tablePlayers);
-      
+      // Get players — filter by current user when userOnly is true
+      final userId = AuthService.instance.userId;
+      final players = widget.userOnly
+          ? (userId != null
+              ? await db.query(
+                  DatabaseHelper.tablePlayers,
+                  where: '${DatabaseHelper.colCreatedBy} = ?',
+                  whereArgs: [userId],
+                )
+              : <Map<String, dynamic>>[])
+          : await db.query(DatabaseHelper.tablePlayers);
+
+      if (players.isEmpty) {
+        setState(() {
+          _playerStats = [];
+          _loading = false;
+          _applyFilter();
+        });
+        return;
+      }
+
+      // ── Bulk-fetch all ball events once — avoids N+1 DB queries ─────────────
+      final allEvents = await db.query(DatabaseHelper.tableBallEvents);
+
+      // Group events by striker, bowler, and out-player for O(1) lookup.
+      final Map<int, List<Map<String, dynamic>>> byStriker  = {};
+      final Map<int, List<Map<String, dynamic>>> byBowler   = {};
+      final Map<int, List<Map<String, dynamic>>> byOutPlayer = {};
+
+      for (final e in allEvents) {
+        final strikerId   = e[DatabaseHelper.colStrikerId]   as int?;
+        final bowlerId    = e[DatabaseHelper.colBowlerId]    as int?;
+        final outPlayerId = e[DatabaseHelper.colOutPlayerId] as int?;
+        final isWicket    = (e[DatabaseHelper.colIsWicket]   as int?) == 1;
+
+        if (strikerId != null) {
+          (byStriker[strikerId] ??= []).add(e);
+        }
+        if (bowlerId != null) {
+          (byBowler[bowlerId] ??= []).add(e);
+        }
+        if (isWicket && outPlayerId != null) {
+          (byOutPlayer[outPlayerId] ??= []).add(e);
+        }
+      }
+      // ─────────────────────────────────────────────────────────────────────────
+
       final stats = <Map<String, dynamic>>[];
       
       for (final player in players) {
@@ -86,11 +163,14 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
         final playerName  = player[DatabaseHelper.colName] as String;
         final team        = player[DatabaseHelper.colTeam] as String;
         
-        // Calculate batting stats across all matches
-        final battingStats = await _calculateCareerBattingStats(playerId);
-        
-        // Calculate bowling stats across all matches
-        final bowlingStats = await _calculateCareerBowlingStats(playerId);
+        // Calculate stats from pre-fetched slices — no DB I/O per player.
+        final battingStats = _calculateCareerBattingStatsFromEvents(
+          byStriker[playerId] ?? [],
+          byOutPlayer[playerId] ?? [],
+        );
+        final bowlingStats = _calculateCareerBowlingStatsFromEvents(
+          byBowler[playerId] ?? [],
+        );
         
         stats.add({
           'id':   playerId,
@@ -114,31 +194,26 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
     }
   }
 
-  Future<Map<String, dynamic>> _calculateCareerBattingStats(int playerId) async {
-    final db = await _db.database;
-    
-    final events = await db.query(
-      DatabaseHelper.tableBallEvents,
-      where: '${DatabaseHelper.colStrikerId} = ?',
-      whereArgs: [playerId],
-    );
-    
+  Map<String, dynamic> _calculateCareerBattingStatsFromEvents(
+    List<Map<String, dynamic>> battingEvents,
+    List<Map<String, dynamic>> dismissalEvents,
+  ) {
     int totalRuns  = 0;
     int ballsFaced = 0;
     int fours      = 0;
     int sixes      = 0;
-    
+
     final inningsPlayed = <String>{};
-    
-    for (final e in events) {
-      final matchId   = e[DatabaseHelper.colMatchId]   as int;
-      final inningsNum= e[DatabaseHelper.colInnings]   as int;
-      final extraType = e[DatabaseHelper.colExtraType] as String?;
-      final runsScored= e[DatabaseHelper.colRunsScored]as int;
+
+    for (final e in battingEvents) {
+      final matchId   = e[DatabaseHelper.colMatchId]    as int;
+      final inningsNum= e[DatabaseHelper.colInnings]    as int;
+      final extraType = e[DatabaseHelper.colExtraType]  as String?;
+      final runsScored= e[DatabaseHelper.colRunsScored] as int;
       final isBoundary= (e[DatabaseHelper.colIsBoundary] as int) == 1;
-      
+
       inningsPlayed.add('$matchId-$inningsNum');
-      
+
       if (extraType != 'bye' && extraType != 'leg_bye') {
         totalRuns += runsScored;
       }
@@ -150,20 +225,12 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
         if (runsScored == 6) sixes++;
       }
     }
-    
-    final innings = inningsPlayed.length;
-    
-    final outs = await db.query(
-      DatabaseHelper.tableBallEvents,
-      where:
-          '${DatabaseHelper.colOutPlayerId} = ? AND ${DatabaseHelper.colIsWicket} = 1',
-      whereArgs: [playerId],
-    );
-    
-    final dismissals  = outs.length;
+
+    final innings     = inningsPlayed.length;
+    final dismissals  = dismissalEvents.length;
     final average     = dismissals > 0 ? totalRuns / dismissals : totalRuns.toDouble();
     final strikeRate  = ballsFaced > 0 ? (totalRuns / ballsFaced) * 100 : 0.0;
-    
+
     return {
       'totalRuns':       totalRuns,
       'ballsFaced':      ballsFaced,
@@ -176,26 +243,19 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
     };
   }
 
-  Future<Map<String, dynamic>> _calculateCareerBowlingStats(int playerId) async {
-    final db = await _db.database;
-    
-    final events = await db.query(
-      DatabaseHelper.tableBallEvents,
-      where: '${DatabaseHelper.colBowlerId} = ?',
-      whereArgs: [playerId],
-    );
-    
+  Map<String, dynamic> _calculateCareerBowlingStatsFromEvents(
+    List<Map<String, dynamic>> bowlingEvents,
+  ) {
     int legalBalls    = 0;
     int runsConceded  = 0;
     int wickets       = 0;
     int maidens       = 0;
-    int bowlingInnings= 0;
-    
-    final overRuns    = <String, int>{};
-    final overBalls   = <String, int>{};
+
+    final overRuns      = <String, int>{};
+    final overBalls     = <String, int>{};
     final inningsBowled = <String>{};
-    
-    for (final e in events) {
+
+    for (final e in bowlingEvents) {
       final matchId   = e[DatabaseHelper.colMatchId]   as int;
       final inningsNum= e[DatabaseHelper.colInnings]   as int;
       final overNum   = e[DatabaseHelper.colOverNum]   as int;
@@ -204,10 +264,10 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
       final extraRuns = e[DatabaseHelper.colExtraRuns] as int;
       final isWicket  = (e[DatabaseHelper.colIsWicket] as int) == 1;
       final wicketType= e[DatabaseHelper.colWicketType] as String?;
-      
+
       inningsBowled.add('$matchId-$inningsNum');
       final overKey = '$matchId-$inningsNum-$overNum';
-      
+
       if (extraType != 'bye' && extraType != 'leg_bye') {
         runsConceded += runsScored + extraRuns;
         overRuns[overKey] = (overRuns[overKey] ?? 0) + runsScored + extraRuns;
@@ -215,30 +275,30 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
         runsConceded += extraRuns;
         overRuns[overKey] = (overRuns[overKey] ?? 0) + extraRuns;
       }
-      
+
       if (extraType != 'wide' && extraType != 'no_ball') {
         legalBalls++;
         overBalls[overKey] = (overBalls[overKey] ?? 0) + 1;
       }
-      
+
       if (isWicket && wicketType != 'run_out') {
         wickets++;
       }
     }
-    
-    bowlingInnings = inningsBowled.length;
-    
+
+    final bowlingInnings = inningsBowled.length;
+
     for (final overKey in overBalls.keys) {
       if (overBalls[overKey] == 6 && (overRuns[overKey] ?? 0) == 0) {
         maidens++;
       }
     }
-    
-    final overs    = legalBalls ~/ 6;
-    final balls    = legalBalls % 6;
-    final economy  = legalBalls > 0 ? (runsConceded / legalBalls) * 6 : 0.0;
+
+    final overs          = legalBalls ~/ 6;
+    final balls          = legalBalls % 6;
+    final economy        = legalBalls > 0 ? (runsConceded / legalBalls) * 6 : 0.0;
     final bowlingAverage = wickets > 0 ? runsConceded / wickets : 0.0;
-    
+
     return {
       'wickets':        wickets,
       'overs':          overs,
@@ -332,66 +392,81 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final c = Theme.of(context).appColors;
     return Scaffold(
-      backgroundColor: _surfaceDark,
-      body: CustomScrollView(
-        slivers: [
-          _buildAppBar(),
-          if (_loading)
-            const SliverFillRemaining(
-              child: Center(
-                child: CircularProgressIndicator(color: _accentGreen),
-              ),
-            )
-          else if (_playerStats.isEmpty)
-            _buildEmptyState()
-          else ...[
-            // ── Charts ──────────────────────────────────────────────────
-            if (_topScorers.isNotEmpty)
+      backgroundColor: c.surface,
+      body: RefreshIndicator(
+        color: c.accentGreen,
+        backgroundColor: const Color(0xFF1A1A1A),
+        onRefresh: _loadPlayerStats,
+        child: CustomScrollView(
+          slivers: [
+            _buildAppBar(c),
+            // Thin progress bar while the downward sync is in-flight.
+            if (_syncing)
               SliverToBoxAdapter(
-                child: _buildManhattanChart(),
+                child: LinearProgressIndicator(
+                  color: c.accentGreen,
+                  backgroundColor: c.accentGreen.withAlpha(30),
+                  minHeight: 2,
+                ),
               ),
-            if (_topBowlers.isNotEmpty)
-              SliverToBoxAdapter(
-                child: _buildBowlersChart(),
-              ),
-            // ── Search bar ──────────────────────────────────────────────
-            _buildSearchBar(),
-            // ── Sort chips + player cards ───────────────────────────────
-            _buildSortChips(),
-            _buildStatsList(),
+            if (_loading)
+              SliverFillRemaining(
+                child: Center(
+                  child: CircularProgressIndicator(color: c.accentGreen),
+                ),
+              )
+            else if (_playerStats.isEmpty)
+              _buildEmptyState(c)
+            else ...[
+              // ── Charts ──────────────────────────────────────────────────
+              if (_topScorers.isNotEmpty)
+                SliverToBoxAdapter(
+                  child: _buildManhattanChart(c),
+                ),
+              if (_topBowlers.isNotEmpty)
+                SliverToBoxAdapter(
+                  child: _buildBowlersChart(c),
+                ),
+              // ── Search bar ──────────────────────────────────────────────
+              _buildSearchBar(c),
+              // ── Sort chips + player cards ───────────────────────────────
+              _buildSortChips(c),
+              _buildStatsList(c),
+            ],
           ],
-        ],
+        ),
       ),
     );
   }
 
   // ── App Bar ──────────────────────────────────────────────────────────────
 
-  Widget _buildAppBar() {
+  Widget _buildAppBar(AppColors c) {
     return SliverAppBar(
       expandedHeight: 100,
       floating: false,
       pinned: true,
-      backgroundColor: _primaryGreen,
+      backgroundColor: c.accentDark,
       automaticallyImplyLeading: false,
       flexibleSpace: FlexibleSpaceBar(
         centerTitle: true,
         title: Text(
-          'Player Analytics',
+          widget.userOnly ? 'My Analytics' : 'Global Analytics',
           style: GoogleFonts.rajdhani(
             fontSize: 20,
             fontWeight: FontWeight.w800,
-            color: _textPrimary,
+            color: c.textPrimary,
             letterSpacing: 1,
           ),
         ),
         background: Container(
-          decoration: const BoxDecoration(
+          decoration: BoxDecoration(
             gradient: LinearGradient(
               begin: Alignment.topLeft,
               end: Alignment.bottomRight,
-              colors: [_primaryGreen, Color(0xFF0D3318)],
+              colors: [c.accentDark, const Color(0xFF0D3318)],
             ),
           ),
         ),
@@ -401,7 +476,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
 
   // ── Empty state ──────────────────────────────────────────────────────────
 
-  Widget _buildEmptyState() {
+  Widget _buildEmptyState(AppColors c) {
     return SliverFillRemaining(
       child: Center(
         child: Column(
@@ -410,23 +485,24 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
             Icon(
               Icons.analytics_outlined,
               size: 80,
-              color: _accentGreen.withAlpha(120),
+              color: c.accentGreen.withAlpha(120),
             ),
             const SizedBox(height: 24),
             Text(
-              'No Player Data Yet',
-              style: GoogleFonts.rajdhani(
+              _syncing ? 'Loading Analytics...' : 'No Player Data Yet',              style: GoogleFonts.rajdhani(
                 fontSize: 24,
                 fontWeight: FontWeight.w700,
-                color: _textSecondary,
+                color: c.textSecondary,
               ),
             ),
             const SizedBox(height: 8),
             Text(
-              'Start scoring matches to see analytics!',
+              _syncing
+                  ? 'Downloading match data from cloud.'
+                  : 'Start scoring matches to see analytics!',
               style: GoogleFonts.rajdhani(
                 fontSize: 16,
-                color: _textSecondary,
+                color: c.textSecondary,
               ),
             ),
           ],
@@ -439,7 +515,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
   // MANHATTAN CHART — top scorers (bar chart)
   // ══════════════════════════════════════════════════════════════════════════
 
-  Widget _buildManhattanChart() {
+  Widget _buildManhattanChart(AppColors c) {
     final scorers = _topScorers;
     final maxRuns = scorers
         .map((p) => p['totalRuns'] as int)
@@ -454,8 +530,8 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
         barRods: [
           BarChartRodData(
             toY: runs,
-            gradient: const LinearGradient(
-              colors: [_accentGreen, _primaryGreen],
+            gradient: LinearGradient(
+              colors: [c.accentGreen, c.accentDark],
               begin: Alignment.topCenter,
               end: Alignment.bottomCenter,
             ),
@@ -467,6 +543,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
     }).toList();
 
     return _buildChartCard(
+      c: c,
       title: 'TOP SCORERS',
       subtitle: 'Career runs',
       child: SizedBox(
@@ -480,7 +557,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
               show: true,
               drawVerticalLine: false,
               getDrawingHorizontalLine: (_) => FlLine(
-                color: _glassBorder,
+                color: c.glassBorder,
                 strokeWidth: 1,
               ),
             ),
@@ -500,7 +577,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
                     value.toInt().toString(),
                     style: GoogleFonts.rajdhani(
                       fontSize: 10,
-                      color: _textSecondary,
+                      color: c.textSecondary,
                     ),
                   ),
                 ),
@@ -523,7 +600,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
                         short,
                         style: GoogleFonts.rajdhani(
                           fontSize: 10,
-                          color: _textSecondary,
+                          color: c.textSecondary,
                         ),
                       ),
                     );
@@ -539,7 +616,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
                   return BarTooltipItem(
                     '$name\n${rod.toY.toInt()} runs',
                     GoogleFonts.rajdhani(
-                      color: _textPrimary,
+                      color: c.textPrimary,
                       fontWeight: FontWeight.w700,
                       fontSize: 13,
                     ),
@@ -557,7 +634,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
   // BOWLERS CHART — wickets bar chart with economy worm overlay
   // ══════════════════════════════════════════════════════════════════════════
 
-  Widget _buildBowlersChart() {
+  Widget _buildBowlersChart(AppColors c) {
     final bowlers  = _topBowlers;
     final maxWkts  = bowlers
         .map((p) => p['wickets'] as int)
@@ -585,6 +662,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
     }).toList();
 
     return _buildChartCard(
+      c: c,
       title: 'BOWLING LEADERS',
       subtitle: 'Wickets taken',
       child: SizedBox(
@@ -598,7 +676,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
               show: true,
               drawVerticalLine: false,
               getDrawingHorizontalLine: (_) => FlLine(
-                color: _glassBorder,
+                color: c.glassBorder,
                 strokeWidth: 1,
               ),
             ),
@@ -623,7 +701,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
                       value.toInt().toString(),
                       style: GoogleFonts.rajdhani(
                         fontSize: 10,
-                        color: _textSecondary,
+                        color: c.textSecondary,
                       ),
                     );
                   },
@@ -647,7 +725,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
                         short,
                         style: GoogleFonts.rajdhani(
                           fontSize: 10,
-                          color: _textSecondary,
+                          color: c.textSecondary,
                         ),
                       ),
                     );
@@ -664,7 +742,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
                   return BarTooltipItem(
                     '${p['name']}\n${rod.toY.toInt()} wkts · Econ $econ',
                     GoogleFonts.rajdhani(
-                      color: _textPrimary,
+                      color: c.textPrimary,
                       fontWeight: FontWeight.w700,
                       fontSize: 13,
                     ),
@@ -683,6 +761,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
   // ══════════════════════════════════════════════════════════════════════════
 
   Widget _buildChartCard({
+    required AppColors c,
     required String title,
     required String subtitle,
     required Widget child,
@@ -696,9 +775,9 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
           child: Container(
             padding: const EdgeInsets.all(16),
             decoration: BoxDecoration(
-              color: _glassBg,
+              color: c.glassBg,
               borderRadius: BorderRadius.circular(16),
-              border: Border.all(color: _glassBorder, width: 1),
+              border: Border.all(color: c.glassBorder, width: 1),
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -708,7 +787,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
                   style: GoogleFonts.rajdhani(
                     fontSize: 12,
                     fontWeight: FontWeight.w700,
-                    color: _accentGreen,
+                    color: c.accentGreen,
                     letterSpacing: 2,
                   ),
                 ),
@@ -716,7 +795,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
                   subtitle,
                   style: GoogleFonts.rajdhani(
                     fontSize: 14,
-                    color: _textSecondary,
+                    color: c.textSecondary,
                   ),
                 ),
                 const SizedBox(height: 12),
@@ -733,7 +812,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
   // SEARCH BAR
   // ══════════════════════════════════════════════════════════════════════════
 
-  Widget _buildSearchBar() {
+  Widget _buildSearchBar(AppColors c) {
     return SliverToBoxAdapter(
       child: Padding(
         padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
@@ -743,38 +822,38 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
             controller: _searchController,
             style: GoogleFonts.rajdhani(
               fontSize: 15,
-              color: _textPrimary,
+              color: c.textPrimary,
               fontWeight: FontWeight.w600,
             ),
             decoration: InputDecoration(
               hintText: 'Search player or team…',
               hintStyle: GoogleFonts.rajdhani(
                 fontSize: 15,
-                color: _textSecondary,
+                color: c.textSecondary,
               ),
-              prefixIcon: const Icon(Icons.search, color: _accentGreen, size: 20),
+              prefixIcon: Icon(Icons.search, color: c.accentGreen, size: 20),
               suffixIcon: _searchQuery.isNotEmpty
                   ? GestureDetector(
                       onTap: () {
                         _searchController.clear();
                       },
-                      child: const Icon(Icons.close, color: _textSecondary, size: 18),
+                      child: Icon(Icons.close, color: c.textSecondary, size: 18),
                     )
                   : null,
               filled: true,
-              fillColor: _glassBg,
+              fillColor: c.glassBg,
               contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
               border: OutlineInputBorder(
                 borderRadius: BorderRadius.circular(12),
-                borderSide: const BorderSide(color: _glassBorder, width: 1),
+                borderSide: BorderSide(color: c.glassBorder, width: 1),
               ),
               enabledBorder: OutlineInputBorder(
                 borderRadius: BorderRadius.circular(12),
-                borderSide: const BorderSide(color: _glassBorder, width: 1),
+                borderSide: BorderSide(color: c.glassBorder, width: 1),
               ),
               focusedBorder: OutlineInputBorder(
                 borderRadius: BorderRadius.circular(12),
-                borderSide: const BorderSide(color: _accentGreen, width: 1.5),
+                borderSide: BorderSide(color: c.accentGreen, width: 1.5),
               ),
             ),
           ),
@@ -787,7 +866,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
   // SORT CHIPS
   // ══════════════════════════════════════════════════════════════════════════
 
-  Widget _buildSortChips() {
+  Widget _buildSortChips(AppColors c) {
     return SliverToBoxAdapter(
       child: Padding(
         padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
@@ -795,15 +874,15 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
           scrollDirection: Axis.horizontal,
           child: Row(
             children: [
-              _buildSortChip('Runs', 'runs'),
+              _buildSortChip(c, 'Runs', 'runs'),
               const SizedBox(width: 8),
-              _buildSortChip('Average', 'average'),
+              _buildSortChip(c, 'Average', 'average'),
               const SizedBox(width: 8),
-              _buildSortChip('Strike Rate', 'strike_rate'),
+              _buildSortChip(c, 'Strike Rate', 'strike_rate'),
               const SizedBox(width: 8),
-              _buildSortChip('Wickets', 'wickets'),
+              _buildSortChip(c, 'Wickets', 'wickets'),
               const SizedBox(width: 8),
-              _buildSortChip('Economy', 'economy'),
+              _buildSortChip(c, 'Economy', 'economy'),
             ],
           ),
         ),
@@ -811,7 +890,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
     );
   }
 
-  Widget _buildSortChip(String label, String sortKey) {
+  Widget _buildSortChip(AppColors c, String label, String sortKey) {
     final isSelected = _sortBy == sortKey;
     
     return GestureDetector(
@@ -819,10 +898,10 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
         decoration: BoxDecoration(
-          color: isSelected ? _accentGreen : Colors.transparent,
+          color: isSelected ? c.accentGreen : Colors.transparent,
           borderRadius: BorderRadius.circular(20),
           border: Border.all(
-            color: isSelected ? _accentGreen : _glassBorder,
+            color: isSelected ? c.accentGreen : c.glassBorder,
             width: 1,
           ),
         ),
@@ -834,7 +913,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
               style: GoogleFonts.rajdhani(
                 fontSize: 14,
                 fontWeight: FontWeight.w700,
-                color: isSelected ? Colors.white : _textSecondary,
+                color: isSelected ? Colors.white : c.textSecondary,
               ),
             ),
             if (isSelected) ...[
@@ -855,7 +934,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
   // PLAYER STATS LIST
   // ══════════════════════════════════════════════════════════════════════════
 
-  Widget _buildStatsList() {
+  Widget _buildStatsList(AppColors c) {
     final list = _filteredStats;
     if (list.isEmpty && _searchQuery.isNotEmpty) {
       return SliverToBoxAdapter(
@@ -864,7 +943,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
           child: Center(
             child: Text(
               'No players match "$_searchQuery"',
-              style: GoogleFonts.rajdhani(fontSize: 15, color: _textSecondary),
+              style: GoogleFonts.rajdhani(fontSize: 15, color: c.textSecondary),
               textAlign: TextAlign.center,
             ),
           ),
@@ -875,14 +954,14 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
       padding: const EdgeInsets.all(16),
       sliver: SliverList(
         delegate: SliverChildBuilderDelegate(
-          (context, index) => _buildPlayerCard(list[index]),
+          (context, index) => _buildPlayerCard(c, list[index]),
           childCount: list.length,
         ),
       ),
     );
   }
 
-  Widget _buildPlayerCard(Map<String, dynamic> stats) {
+  Widget _buildPlayerCard(AppColors c, Map<String, dynamic> stats) {
     final name          = stats['name']          as String;
     final team          = stats['team']          as String;
     final totalRuns     = stats['totalRuns']     as int;
@@ -904,9 +983,9 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
           child: Container(
             padding: const EdgeInsets.all(16),
             decoration: BoxDecoration(
-              color: _glassBg,
+              color: c.glassBg,
               borderRadius: BorderRadius.circular(16),
-              border: Border.all(color: _glassBorder, width: 1),
+              border: Border.all(color: c.glassBorder, width: 1),
             ),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -918,7 +997,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
                       width: 40,
                       height: 40,
                       decoration: BoxDecoration(
-                        color: _accentGreen.withAlpha(40),
+                        color: c.accentGreen.withAlpha(40),
                         borderRadius: BorderRadius.circular(10),
                       ),
                       child: Center(
@@ -927,7 +1006,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
                           style: GoogleFonts.rajdhani(
                             fontSize: 20,
                             fontWeight: FontWeight.w800,
-                            color: _accentGreen,
+                            color: c.accentGreen,
                           ),
                         ),
                       ),
@@ -942,7 +1021,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
                             style: GoogleFonts.rajdhani(
                               fontSize: 18,
                               fontWeight: FontWeight.w800,
-                              color: _textPrimary,
+                              color: c.textPrimary,
                             ),
                             overflow: TextOverflow.ellipsis,
                           ),
@@ -950,7 +1029,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
                             team,
                             style: GoogleFonts.rajdhani(
                               fontSize: 12,
-                              color: _textSecondary,
+                              color: c.textSecondary,
                               fontWeight: FontWeight.w600,
                             ),
                           ),
@@ -963,15 +1042,15 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
                 
                 // Batting Stats
                 if (battingInnings > 0) ...[
-                  _buildSectionLabel('BATTING'),
+                  _buildSectionLabel(c, 'BATTING'),
                   const SizedBox(height: 8),
                   Row(
                     children: [
-                      _buildStatItem('Runs', totalRuns.toString()),
-                      _buildStatItem('Avg', battingAverage.toStringAsFixed(1)),
-                      _buildStatItem('SR', strikeRate.toStringAsFixed(1)),
-                      _buildStatItem('4s', fours.toString()),
-                      _buildStatItem('6s', sixes.toString()),
+                      _buildStatItem(c, 'Runs', totalRuns.toString()),
+                      _buildStatItem(c, 'Avg', battingAverage.toStringAsFixed(1)),
+                      _buildStatItem(c, 'SR', strikeRate.toStringAsFixed(1)),
+                      _buildStatItem(c, '4s', fours.toString()),
+                      _buildStatItem(c, '6s', sixes.toString()),
                     ],
                   ),
                   const SizedBox(height: 12),
@@ -979,16 +1058,16 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
                 
                 // Bowling Stats
                 if (bowlingInnings > 0) ...[
-                  _buildSectionLabel('BOWLING'),
+                  _buildSectionLabel(c, 'BOWLING'),
                   const SizedBox(height: 8),
                   Row(
                     children: [
-                      _buildStatItem('Wkts', wickets.toString()),
-                      _buildStatItem('Econ', economy.toStringAsFixed(2)),
+                      _buildStatItem(c, 'Wkts', wickets.toString()),
+                      _buildStatItem(c, 'Econ', economy.toStringAsFixed(2)),
                       _buildStatItem(
-                          'Overs', '${stats['overs']}.${stats['oversBalls']}'),
-                      _buildStatItem('Runs', stats['runsConceded'].toString()),
-                      _buildStatItem('Mdns', stats['maidens'].toString()),
+                          c, 'Overs', '${stats['overs']}.${stats['oversBalls']}'),
+                      _buildStatItem(c, 'Runs', stats['runsConceded'].toString()),
+                      _buildStatItem(c, 'Mdns', stats['maidens'].toString()),
                     ],
                   ),
                 ],
@@ -999,7 +1078,7 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
                     'No match data yet',
                     style: GoogleFonts.rajdhani(
                       fontSize: 14,
-                      color: _textSecondary,
+                      color: c.textSecondary,
                     ),
                   ),
               ],
@@ -1010,19 +1089,19 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
     );
   }
 
-  Widget _buildSectionLabel(String label) {
+  Widget _buildSectionLabel(AppColors c, String label) {
     return Text(
       label,
       style: GoogleFonts.rajdhani(
         fontSize: 10,
         fontWeight: FontWeight.w700,
-        color: _accentGreen,
+        color: c.accentGreen,
         letterSpacing: 2,
       ),
     );
   }
 
-  Widget _buildStatItem(String label, String value) {
+  Widget _buildStatItem(AppColors c, String label, String value) {
     return Expanded(
       child: Column(
         children: [
@@ -1031,14 +1110,14 @@ class _AnalyticsScreenState extends State<AnalyticsScreen> {
             style: GoogleFonts.rajdhani(
               fontSize: 18,
               fontWeight: FontWeight.w800,
-              color: _textPrimary,
+              color: c.textPrimary,
             ),
           ),
           Text(
             label,
             style: GoogleFonts.rajdhani(
               fontSize: 10,
-              color: _textSecondary,
+              color: c.textSecondary,
               fontWeight: FontWeight.w600,
             ),
           ),

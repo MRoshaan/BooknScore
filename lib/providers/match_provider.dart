@@ -65,11 +65,19 @@ class MatchProvider extends ChangeNotifier {
   bool _needsInningsChange = false; // Trigger when innings complete
   bool _matchEnded = false; // Match is complete
   String? _matchResult; // e.g., "Team A won by 5 wickets"
+  bool _newBatterIsRetirement = false; // true when triggered by retire, not wicket
   
   // ── Processing State ──────────────────────────────────────────────────────
   bool _isLoading = false;
   bool _isProcessing = false;
   String? _error;
+
+  // Re-entrancy guard: prevents a second concurrent loadMatch() call from
+  // interleaving with a still-running first call.  Without this, rapid
+  // navigation (e.g. double-tap on a match card) or the toss-dialog confirm
+  // button calling loadMatch() while initState is already mid-load would
+  // cause two async executions to share and corrupt the same provider fields.
+  bool _isLoadingMatch = false;
   
   // ── ICC Caught Rule flag ──────────────────────────────────────────────────
   // Set to true when a caught wicket falls on a ball that is NOT the last ball
@@ -78,8 +86,20 @@ class MatchProvider extends ChangeNotifier {
   // unless the over just ended).
   bool _caughtNotLastBallOfOver = false;
 
+  // Set to true when the NON-STRIKER is run out.  Consumed by
+  // setNewBatterWithName() so the incoming batter is placed at the non-striker
+  // end (the striker continues to face; the new batter enters as non-striker).
+  bool _nonStrikerRunOutPending = false;
+
   // ── Batting lineup tracking ───────────────────────────────────────────────
   int _nextBatterNumber = 3; // After opening pair (for unnamed fallback)
+
+  // ── Retired player tracking ───────────────────────────────────────────────
+  // Retired-hurt players can return to bat; their IDs are kept here so the
+  // new-batter modal can offer them as selectable options again.
+  // Retired-out players are tracked in _retiredOutPlayerIds — they cannot return.
+  final Set<int> _retiredPlayerIds = {};    // retired hurt — can return
+  final Set<int> _retiredOutPlayerIds = {}; // retired out — cannot return
 
   // ── Live Commentary ───────────────────────────────────────────────────────
   // Newest entry is at index 0 (reverse chronological order).
@@ -119,7 +139,8 @@ class MatchProvider extends ChangeNotifier {
   
   String get teamA => _match?[DatabaseHelper.colTeamA] ?? 'Team A';
   String get teamB => _match?[DatabaseHelper.colTeamB] ?? 'Team B';
-  String? get tournamentName => _match?[DatabaseHelper.colTournamentName];
+  /// Tournament name resolved by JOIN on tournaments table (nullable).
+  String? get tournamentName => _match?['tournament_name'] as String?;
   
   String get battingTeam {
     final tossWinner = _match?[DatabaseHelper.colTossWinner];
@@ -176,6 +197,12 @@ class MatchProvider extends ChangeNotifier {
   /// The name of the bowler who bowled the immediately preceding over.
   /// Used to enforce the consecutive-over rule in the UI.
   String? get previousBowlerName => _previousBowlerName;
+
+  /// IDs of players who have retired hurt and may return to bat.
+  Set<int> get retiredPlayerIds => Set.unmodifiable(_retiredPlayerIds);
+
+  /// IDs of players who have retired out and cannot return.
+  Set<int> get retiredOutPlayerIds => Set.unmodifiable(_retiredOutPlayerIds);
   
   String get strikerName => _strikerName;
   String get nonStrikerName => _nonStrikerName;
@@ -212,6 +239,10 @@ class MatchProvider extends ChangeNotifier {
   bool get needsInningsChange => _needsInningsChange;
   bool get matchEnded => _matchEnded;
   String? get matchResult => _matchResult;
+
+  /// True when [needsNewBatter] was triggered by a retirement (not a wicket).
+  /// Used by the new-batter modal to show appropriate header text.
+  bool get newBatterIsRetirement => _newBatterIsRetirement;
   
   // State
   bool get isLoading => _isLoading;
@@ -265,13 +296,23 @@ class MatchProvider extends ChangeNotifier {
 
   /// Load match and innings data from database.
   Future<void> loadMatch(int matchId) async {
+    // Re-entrancy guard: if a previous loadMatch() call is still awaiting DB
+    // results, ignore this call entirely rather than letting two async
+    // executions interleave and corrupt shared provider state.
+    if (_isLoadingMatch) return;
+    _isLoadingMatch = true;
+
+    // ── Hard-reset all in-memory state before reading from DB ─────────────────
+    // resetState() guarantees a clean slate so that re-opening the scoring
+    // screen never double-accumulates totals on top of a previous session.
+    resetState();
+
+    _matchId = matchId;
     _isLoading = true;
-    _error = null;
     notifyListeners();
 
     try {
-      _matchId = matchId;
-      _match = await DatabaseHelper.instance.fetchMatch(matchId);
+      _match = await DatabaseHelper.instance.fetchMatchWithTournamentName(matchId);
       
       if (_match == null) {
         _error = 'Match not found';
@@ -282,12 +323,27 @@ class MatchProvider extends ChangeNotifier {
       
       _currentInnings = _match![DatabaseHelper.colCurrentInnings] as int;
       _target = _match![DatabaseHelper.colTarget] as int?;
-      
+
+      // ── Innings auto-recovery ──────────────────────────────────────────────
+      // If the app closed while the "Innings Complete" dialog was still showing,
+      // current_innings in DB may still be 1 even though 2nd innings has started.
+      // Guard: if current_innings is 1 but ball_events for innings 2 already exist,
+      // auto-advance to innings 2 so the scorer is never stuck on a locked innings.
+      if (_currentInnings == 1) {
+        final inn2Balls = await DatabaseHelper.instance.fetchBallEvents(matchId, innings: 2);
+        if (inn2Balls.isNotEmpty) {
+          _currentInnings = 2;
+          await DatabaseHelper.instance.updateCurrentInnings(matchId, 2);
+        }
+      }
+
       // Load first innings score if in 2nd innings
       if (_currentInnings == 2 && _target == null) {
         final firstInningsSummary = await DatabaseHelper.instance.getInningsSummary(matchId, 1);
         _firstInningsScore = firstInningsSummary['totalRuns'];
         _target = _firstInningsScore! + 1;
+        // Persist the calculated target so future loads don't need to recalculate
+        await DatabaseHelper.instance.setTarget(matchId, _target!);
       }
       
       await _refreshInningsState();
@@ -368,9 +424,29 @@ class MatchProvider extends ChangeNotifier {
         // for the next ball to trigger a refresh.
         await _recalculateBatterStats();
         await _recalculateBowlerStats();
+
+        // ── Restore pending-action flags ─────────────────────────────────────
+        // After a crash/reopen the UI must re-present any modal that was
+        // interrupted mid-flow.  We derive the required state from the DB.
+
+        // 1. Need new bowler: we are between overs (no balls in current over yet
+        //    and at least one over has been completed).
+        if (_ballsInCurrentOver == 0 && _completedOvers > 0 && _completedOvers < totalOvers) {
+          _needsNewBowler = true;
+        }
+
+        // 2. Need new batter: last ball was a wicket and there are batters left.
+        if (lastBall.isWicket && _totalWickets < squadSize - 1) {
+          _needsNewBatter = true;
+          // If the last ball was specifically a non-striker run-out we cannot
+          // reliably infer it here (the flag is transient), so we leave
+          // _nonStrikerRunOutPending = false and the incoming batter will
+          // default to replacing the striker end — acceptable for recovery.
+        }
       }
       
       _isLoading = false;
+      _isLoadingMatch = false;
       notifyListeners();
     } catch (e, st) {
       developer.log(
@@ -382,6 +458,7 @@ class MatchProvider extends ChangeNotifier {
       );
       _error = 'Failed to load match. Please try again.';
       _isLoading = false;
+      _isLoadingMatch = false;
       notifyListeners();
     }
   }
@@ -501,11 +578,18 @@ class MatchProvider extends ChangeNotifier {
   /// For run-outs, [extraType] may be 'bye' or 'leg_bye' and [extraRuns] > 0
   /// to record any runs completed before the wicket.  For off-bat run-outs,
   /// pass [runsScored] instead.
+  ///
+  /// [outBatterIsStriker] — for run-outs only. Pass `true` if the striker was
+  /// run out, `false` if the non-striker was.  Defaults to `true` (striker out).
+  /// This determines which player ID is recorded as `out_player_id` and, when
+  /// the non-striker is dismissed, ensures the striker stays at the crease as
+  /// the continuing batter.
   Future<void> recordWicket({
     String wicketType = 'bowled',
     int runsScored = 0,
     String? extraType,
     int extraRuns = 0,
+    bool outBatterIsStriker = true,
   }) async {
     if (_isProcessing || _matchId == null) return;
     if (_needsNewBatter || _needsNewBowler || _needsOpeningPlayers) return;
@@ -516,6 +600,7 @@ class MatchProvider extends ChangeNotifier {
       wicketType: wicketType,
       extraType: extraType,
       extraRuns: extraRuns,
+      outBatterIsStriker: outBatterIsStriker,
     );
   }
 
@@ -583,6 +668,83 @@ class MatchProvider extends ChangeNotifier {
     _nonStrikerStats = tempStats;
     
     notifyListeners();
+  }
+
+  // ── Zero-ball player management ──────────────────────────────────────────
+
+  /// Retire the current striker hurt (can return later).
+  ///
+  /// No ball event is recorded.  The striker is removed from the crease and
+  /// [_needsNewBatter] is set so the UI prompts for a replacement.
+  void retireBatterHurt() {
+    if (_strikerId != null) _retiredPlayerIds.add(_strikerId!);
+    _strikerId = null;
+    _strikerName = '';
+    _strikerStats = {'runs': 0, 'balls': 0, 'fours': 0, 'sixes': 0};
+    _needsNewBatter = true;
+    _newBatterIsRetirement = true;
+    notifyListeners();
+  }
+
+  /// Retire the current striker out (cannot return).
+  ///
+  /// No ball event is recorded.  The striker is removed from the crease and
+  /// [_needsNewBatter] is set so the UI prompts for a replacement.
+  void retireBatterOut() {
+    if (_strikerId != null) _retiredOutPlayerIds.add(_strikerId!);
+    _strikerId = null;
+    _strikerName = '';
+    _strikerStats = {'runs': 0, 'balls': 0, 'fours': 0, 'sixes': 0};
+    _needsNewBatter = true;
+    _newBatterIsRetirement = true;
+    notifyListeners();
+  }
+
+  /// Change the current bowler mid-over (injury / other reason).
+  ///
+  /// No ball event is recorded.  Mirrors [setNewBowlerWithName] but does NOT
+  /// snapshot [_previousBowlerId] — the over has not ended, so the same over
+  /// continues with the new bowler.
+  Future<void> changeBowlerMidOver(String bowlerName) async {
+    if (_matchId == null) return;
+
+    final userId = AuthService.instance.currentUser?.id;
+    final db = DatabaseHelper.instance;
+
+    try {
+      int bowlerId =
+          await db.findPlayerIdByNameAndTeam(bowlerName, bowlingTeam) ??
+          await db.insertPlayer(
+            name: bowlerName,
+            team: bowlingTeam,
+            role: 'bowler',
+            createdBy: userId,
+          );
+
+      await db.addPlayerToMatch(
+        matchId: _matchId!,
+        playerId: bowlerId,
+        team: bowlingTeam == teamA ? 'team_a' : 'team_b',
+        createdBy: userId,
+      );
+
+      _currentBowlerId = bowlerId;
+      _bowlerName = bowlerName;
+      // _needsNewBowler stays as-is (mid-over change doesn't end the over)
+
+      await _recalculateBowlerStats();
+      notifyListeners();
+    } catch (e, st) {
+      developer.log(
+        'changeBowlerMidOver failed',
+        name: 'MatchProvider',
+        error: e,
+        stackTrace: st,
+        level: 1000,
+      );
+      _error = 'Failed to change bowler. Please try again.';
+      notifyListeners();
+    }
   }
 
   /// Set new bowler with name (called from end-of-over modal).
@@ -669,27 +831,41 @@ class MatchProvider extends ChangeNotifier {
         createdBy: userId,
       );
       
-      // New batter comes in as striker (replacing the out batter).
-      // ICC Caught Rule: the incoming batter always takes the strike, regardless
-      // of whether the batters had crossed before the catch.  The flag
-      // _caughtNotLastBallOfOver was set by _recordBallEvent; if it is true the
-      // non-striker is the surviving batter who crossed and is currently sitting
-      // at _strikerId's end — we need to swap before placing the new batter so
-      // the survivor moves to non-striker and the new batter faces next ball.
-      if (_caughtNotLastBallOfOver) {
-        // Survivor is currently stored as _nonStrikerId (they were non-striker
-        // when the ball was bowled).  Strike rotation from the catch delivery
-        // may have swapped them already.  The new batter must be the next striker.
-        // Simply placing batterId into _strikerId is enough since _strikerId is
-        // who faces the next ball.
-      }
-      _caughtNotLastBallOfOver = false; // consume the flag
+      // New batter placement rules:
+      //
+      // 1. Non-striker run-out: the striker continues to face. The new batter
+      //    enters at the non-striker end.  _nonStrikerRunOutPending is set by
+      //    _recordBallEvent in this scenario.
+      //
+      // 2. Normal dismissal / striker run-out: the new batter always takes the
+      //    strike (faces the next ball) — they go into _strikerId.
+      //
+      // 3. ICC Caught Rule: new batter takes strike regardless of crossing.
+      //    _caughtNotLastBallOfOver handles the mid-over case (no extra swap
+      //    needed since the survivor is already in _nonStrikerId after rotation).
 
-      _strikerId = batterId;
-      _strikerName = batterName;
-      _strikerStats = {'runs': 0, 'balls': 0, 'fours': 0, 'sixes': 0};
+      _caughtNotLastBallOfOver = false; // consume caught flag
+
+      if (_nonStrikerRunOutPending) {
+        // Non-striker was dismissed — place new batter at non-striker end.
+        _nonStrikerId = batterId;
+        _nonStrikerName = batterName;
+        _nonStrikerStats = {'runs': 0, 'balls': 0, 'fours': 0, 'sixes': 0};
+        _nonStrikerRunOutPending = false;
+      } else {
+        // All other cases: new batter takes the strike.
+        _strikerId = batterId;
+        _strikerName = batterName;
+        _strikerStats = {'runs': 0, 'balls': 0, 'fours': 0, 'sixes': 0};
+      }
+
+      // If this batter was previously retired hurt, remove them from the
+      // retired set — they are now back on the crease.
+      _retiredPlayerIds.remove(batterId);
+
       _nextBatterNumber++;
       _needsNewBatter = false;
+      _newBatterIsRetirement = false;
       
       notifyListeners();
     } catch (e, st) {
@@ -904,6 +1080,19 @@ class MatchProvider extends ChangeNotifier {
       _isProcessing = false;
       notifyListeners();
     }
+  }
+
+  /// Declare the current innings (e.g. captain's declaration).
+  ///
+  /// Unlike [endInnings] — which silently transitions to the 2nd innings —
+  /// this method simply sets [_needsInningsChange] and notifies listeners so
+  /// that [_checkAndShowDialogs] in the scoring screen picks it up and shows
+  /// the innings-change summary modal before advancing.  The modal itself then
+  /// calls [endInnings] to perform the actual transition.
+  void declareInnings() {
+    if (_currentInnings >= 2 || _matchId == null) return;
+    _needsInningsChange = true;
+    notifyListeners();
   }
 
   /// Complete the match.
@@ -1126,11 +1315,19 @@ class MatchProvider extends ChangeNotifier {
     }
   }
 
-  /// Clear provider state (call when leaving scoring screen).
-  void clearMatch() {
+  /// Hard-reset every piece of in-memory state to its zero/null/empty default.
+  ///
+  /// Call this before fetching any match data from the database so that a
+  /// re-opened scoring screen never accumulates totals on top of a previous
+  /// session.  The required sequence is:
+  ///   1. resetState()          – wipe the slate clean
+  ///   2. fetch DB history      – load ball_events from SQLite
+  ///   3. rebuild live score    – derive totals from the fetched history
+  void resetState() {
     _matchId = null;
     _match = null;
     _currentInnings = 1;
+    // Score accumulators
     _totalRuns = 0;
     _totalWickets = 0;
     _completedOvers = 0;
@@ -1140,6 +1337,7 @@ class MatchProvider extends ChangeNotifier {
     _sixes = 0;
     _target = null;
     _firstInningsScore = null;
+    // Active players
     _strikerId = null;
     _nonStrikerId = null;
     _currentBowlerId = null;
@@ -1148,23 +1346,40 @@ class MatchProvider extends ChangeNotifier {
     _strikerName = 'Batter 1';
     _nonStrikerName = 'Batter 2';
     _bowlerName = 'Bowler';
+    // Per-player live stats
     _strikerStats = {'runs': 0, 'balls': 0, 'fours': 0, 'sixes': 0};
     _nonStrikerStats = {'runs': 0, 'balls': 0, 'fours': 0, 'sixes': 0};
     _bowlerStats = {'overs': 0, 'balls': 0, 'maidens': 0, 'runs': 0, 'wickets': 0, 'economy': 0.0};
-    _currentOverBalls = [];
-    _allBallsThisInnings = [];
+    // Ball-event lists
+    _currentOverBalls.clear();
+    _allBallsThisInnings.clear();
+    // UI trigger flags
     _needsOpeningPlayers = false;
     _needsNewBatter = false;
     _needsNewBowler = false;
     _needsInningsChange = false;
     _matchEnded = false;
     _matchResult = null;
-    _nextBatterNumber = 3;
+    _newBatterIsRetirement = false;
+    // ICC rule flags
     _caughtNotLastBallOfOver = false;
-    _commentary = [];
+    _nonStrikerRunOutPending = false;
+    // Batting lineup / retired player tracking
+    _nextBatterNumber = 3;
+    _retiredPlayerIds.clear();
+    _retiredOutPlayerIds.clear();
+    // Commentary
+    _commentary.clear();
+    // Processing / loading guards
     _isLoading = false;
+    _isLoadingMatch = false;
     _isProcessing = false;
     _error = null;
+  }
+
+  /// Clear provider state (call when leaving scoring screen).
+  void clearMatch() {
+    resetState();
     notifyListeners();
   }
 
@@ -1179,6 +1394,8 @@ class MatchProvider extends ChangeNotifier {
     String? wicketType,
     String? extraType,
     int extraRuns = 0,
+    // For run-outs: true = striker dismissed, false = non-striker dismissed.
+    bool outBatterIsStriker = true,
   }) async {
     _isProcessing = true;
     notifyListeners();
@@ -1209,7 +1426,13 @@ class MatchProvider extends ChangeNotifier {
         strikerId:    _strikerId,
         nonStrikerId: _nonStrikerId,
         bowlerId:     _currentBowlerId,
-        outPlayerId:  isWicket ? _strikerId : null,
+        // For run-outs, respect which batter was dismissed.
+        // All other dismissal types always dismiss the striker.
+        outPlayerId:  isWicket
+            ? (wicketType == 'run_out' && !outBatterIsStriker
+                ? _nonStrikerId
+                : _strikerId)
+            : null,
         createdBy:    userId,
       );
 
@@ -1263,6 +1486,16 @@ class MatchProvider extends ChangeNotifier {
         _caughtNotLastBallOfOver = false;
       }
 
+      // ── Capture dismissed player ID BEFORE strike rotation ───────────────
+      // Strike rotation (swapStrike) runs next and will shuffle _strikerId /
+      // _nonStrikerId.  For run-outs we need to know which exact player ID was
+      // dismissed so we can null out the correct slot AFTER rotation, without
+      // relying on the flag alone (the flag tells us who was out PRE-rotation,
+      // but the slot they ended up in POST-rotation depends on run parity).
+      final int? dismissedPlayerId = isWicket && wicketType == 'run_out'
+          ? (outBatterIsStriker ? _strikerId : _nonStrikerId)
+          : null;
+
       // Handle strike rotation
       // Rotate on: odd physical runs (wides now included if odd physical runs).
       // Also rotate at end of over.
@@ -1275,6 +1508,36 @@ class MatchProvider extends ChangeNotifier {
         swapStrike();
       }
       // If both shouldRotate AND overComplete, they cancel out
+
+      // ── Run-out: null the dismissed player's slot and ensure survivor faces ─
+      // Now that rotation may have swapped the slots, we use the captured ID to
+      // find where the dismissed player ended up and clear that slot.  Then we
+      // guarantee the surviving batter is always in _strikerId (they face next).
+      if (dismissedPlayerId != null) {
+        if (_strikerId == dismissedPlayerId) {
+          _strikerId = null;
+          _strikerName = '';
+          _strikerStats = {'runs': 0, 'balls': 0, 'fours': 0, 'sixes': 0};
+        } else if (_nonStrikerId == dismissedPlayerId) {
+          _nonStrikerId = null;
+          _nonStrikerName = '';
+          _nonStrikerStats = {'runs': 0, 'balls': 0, 'fours': 0, 'sixes': 0};
+        }
+        // Ensure the survivor is always the striker (faces the next ball).
+        // If rotation left the survivor in _nonStrikerId, swap back.
+        if (_strikerId == null && _nonStrikerId != null) {
+          _strikerId = _nonStrikerId;
+          _strikerName = _nonStrikerName;
+          _strikerStats = Map<String, int>.from(_nonStrikerStats);
+          _nonStrikerId = null;
+          _nonStrikerName = '';
+          _nonStrikerStats = {'runs': 0, 'balls': 0, 'fours': 0, 'sixes': 0};
+        }
+        // New batter always goes to the non-striker end for run-outs:
+        // the survivor is now in _strikerId and will keep facing; the
+        // incoming batter enters at _nonStrikerId.
+        _nonStrikerRunOutPending = true;
+      }
 
       await _refreshInningsState();
 
@@ -1301,9 +1564,9 @@ class MatchProvider extends ChangeNotifier {
           final extra = runsScored > 0 ? ', $runsScored runs' : '';
           outcome = 'No Ball$extra';
         } else if (extraType == 'bye') {
-          outcome = '${extraRuns == 1 ? '1 bye' : '$extraRuns byes'}';
+          outcome = extraRuns == 1 ? '1 bye' : '$extraRuns byes';
         } else if (extraType == 'leg_bye') {
-          outcome = '${extraRuns == 1 ? '1 leg bye' : '$extraRuns leg byes'}';
+          outcome = extraRuns == 1 ? '1 leg bye' : '$extraRuns leg byes';
         } else if (runsScored == 0) {
           outcome = 'dot ball';
         } else {
@@ -1321,6 +1584,12 @@ class MatchProvider extends ChangeNotifier {
       // Wicket: need new batter (unless all out)
       if (isWicket && _totalWickets < squadSize - 1) {
         _needsNewBatter = true;
+        // _nonStrikerRunOutPending is set above in the run-out block for ALL
+        // run-outs (striker or non-striker dismissed).  For non-run-out wickets
+        // it is always false — clear it here to be safe.
+        if (wicketType != 'run_out') {
+          _nonStrikerRunOutPending = false;
+        }
       }
       
       // End of over: need new bowler.
@@ -1365,6 +1634,29 @@ class MatchProvider extends ChangeNotifier {
 
   Future<void> _refreshInningsState() async {
     if (_matchId == null) return;
+
+    // ── HARD RESET all score accumulators before rebuilding from DB ───────────
+    // This prevents double-counting when loadMatch() / undoLastBall() calls this
+    // function on a provider that already holds stale in-memory totals.
+    // Every variable that derives from ball_events must be zeroed here so that
+    // the values assigned below are sourced exclusively from the DB query.
+    _totalRuns          = 0;
+    _totalWickets       = 0;
+    _completedOvers     = 0;
+    _ballsInCurrentOver = 0;
+    _extras             = 0;
+    _fours              = 0;
+    _sixes              = 0;
+    // Also reset active batter/bowler temporary stats so they are rebuilt clean
+    // by _recalculateBatterStats / _recalculateBowlerStats below.
+    _strikerStats    = {'runs': 0, 'balls': 0, 'fours': 0, 'sixes': 0};
+    _nonStrikerStats = {'runs': 0, 'balls': 0, 'fours': 0, 'sixes': 0};
+    _bowlerStats     = {'overs': 0, 'balls': 0, 'maidens': 0, 'runs': 0, 'wickets': 0, 'economy': 0.0};
+    // Explicitly clear ball lists so _loadCurrentOverBalls / _loadAllBallsThisInnings
+    // start from a clean slate rather than appending to any pre-existing entries.
+    _currentOverBalls.clear();
+    _allBallsThisInnings.clear();
+    // ─────────────────────────────────────────────────────────────────────────
 
     final summary = await DatabaseHelper.instance.getInningsSummary(
       _matchId!,
@@ -1460,25 +1752,47 @@ class MatchProvider extends ChangeNotifier {
     int legalBalls = 0;
     int runsConceded = 0;
     int wickets = 0;
+    int maidens = 0;
+
+    // Track runs and legal balls per over for maiden calculation
+    final Map<int, int> runsPerOver = {};
+    final Map<int, int> ballsPerOver = {};
     
     for (final e in events) {
       final extraType = e.extraType;
       
-      // Count runs conceded
+      // Byes and leg-byes are not charged to the bowler; wides/no-balls ARE.
       if (extraType != 'bye' && extraType != 'leg_bye') {
         runsConceded += e.runsScored + e.extraRuns;
-      } else {
-        runsConceded += e.extraRuns;
       }
+      // bye / leg_bye: add zero to runsConceded (intentionally omitted).
       
-      // Count legal deliveries
+      // Count legal deliveries and track per-over totals for maiden calc
       if (extraType != 'wide' && extraType != 'no_ball') {
         legalBalls++;
+        ballsPerOver[e.overNum] = (ballsPerOver[e.overNum] ?? 0) + 1;
+        // Only off-bat runs count toward "runs in over" for maiden purposes;
+        // byes/LBs do not cancel a maiden (not charged to bowler).
+        if (extraType != 'bye' && extraType != 'leg_bye') {
+          runsPerOver[e.overNum] = (runsPerOver[e.overNum] ?? 0) + e.runsScored + e.extraRuns;
+        } else {
+          runsPerOver[e.overNum] = (runsPerOver[e.overNum] ?? 0);
+        }
+      } else {
+        // Wides/no-balls add extra runs to that over's total
+        runsPerOver[e.overNum] = (runsPerOver[e.overNum] ?? 0) + e.extraRuns;
       }
       
       // Count wickets (not run outs)
       if (e.isWicket && e.wicketType != 'run_out') {
         wickets++;
+      }
+    }
+
+    // Maiden: 6 legal balls in that over with 0 runs conceded (byes/LB excluded)
+    for (final over in ballsPerOver.keys) {
+      if (ballsPerOver[over] == 6 && (runsPerOver[over] ?? 0) == 0) {
+        maidens++;
       }
     }
     
@@ -1489,7 +1803,7 @@ class MatchProvider extends ChangeNotifier {
     _bowlerStats = {
       'overs': overs,
       'balls': balls,
-      'maidens': 0, // Simplified for now
+      'maidens': maidens,
       'runs': runsConceded,
       'wickets': wickets,
       'economy': economy,

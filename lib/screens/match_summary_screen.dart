@@ -1,22 +1,15 @@
 import 'dart:io';
 
+import 'package:cached_network_image/cached_network_image.dart';
 import 'package:flutter/material.dart';
 import 'package:google_fonts/google_fonts.dart';
 import 'package:fl_chart/fl_chart.dart';
 
 import '../services/database_helper.dart';
+import '../theme.dart';
 import 'tournament_champions_screen.dart';
 
-// ── Brand Palette ─────────────────────────────────────────────────────────────
-const Color _primaryGreen  = Color(0xFF1B5E20);
-const Color _accentGreen   = Color(0xFF4CAF50);
-const Color _surfaceDark   = Color(0xFF0A0A0A);
-const Color _glassBg       = Color(0x1A4CAF50);
-const Color _glassBorder   = Color(0x334CAF50);
-const Color _textPrimary   = Colors.white;
-const Color _textSecondary = Color(0xFFB0B0B0);
-
-// Per-innings colours
+// Per-innings colours (fixed, not theme-adaptive)
 const Color _inn1Color = Color(0xFF4CAF50); // green
 const Color _inn2Color = Color(0xFF1E88E5); // blue
 
@@ -302,10 +295,11 @@ class _MatchSummaryScreenState extends State<MatchSummaryScreen>
 
   @override
   Widget build(BuildContext context) {
+    final c = Theme.of(context).appColors;
     return Scaffold(
-      backgroundColor: _surfaceDark,
+      backgroundColor: c.surface,
       appBar: AppBar(
-        backgroundColor: _primaryGreen,
+        backgroundColor: c.accentDark,
         foregroundColor: Colors.white,
         elevation: 0,
         centerTitle: true,
@@ -324,7 +318,7 @@ class _MatchSummaryScreenState extends State<MatchSummaryScreen>
               style: GoogleFonts.rajdhani(
                 fontSize: 10,
                 fontWeight: FontWeight.w600,
-                color: _accentGreen,
+                color: c.accentGreen,
                 letterSpacing: 3,
               ),
             ),
@@ -332,9 +326,9 @@ class _MatchSummaryScreenState extends State<MatchSummaryScreen>
         ),
         bottom: TabBar(
           controller: _tabController,
-          indicatorColor: _accentGreen,
-          labelColor: _accentGreen,
-          unselectedLabelColor: _textSecondary,
+          indicatorColor: c.accentGreen,
+          labelColor: c.accentGreen,
+          unselectedLabelColor: c.textSecondary,
           labelStyle: GoogleFonts.rajdhani(
             fontWeight: FontWeight.w700,
             fontSize: 14,
@@ -346,7 +340,7 @@ class _MatchSummaryScreenState extends State<MatchSummaryScreen>
         ),
       ),
       body: _loading
-          ? const Center(child: CircularProgressIndicator(color: _accentGreen))
+          ? Center(child: CircularProgressIndicator(color: c.accentGreen))
           : Column(
               children: [
                 // ── Man of the Match FIFA card ──────────────────────────────
@@ -357,8 +351,8 @@ class _MatchSummaryScreenState extends State<MatchSummaryScreen>
                   child: TabBarView(
                     controller: _tabController,
                     children: [
-                      _buildManhattanTab(),
-                      _buildWormTab(),
+                      _buildManhattanTab(c),
+                      _buildWormTab(c),
                     ],
                   ),
                 ),
@@ -369,7 +363,7 @@ class _MatchSummaryScreenState extends State<MatchSummaryScreen>
 
   // ── Legend ────────────────────────────────────────────────────────────────
 
-  Widget _buildLegend() {
+  Widget _buildLegend(AppColors c) {
     final hasInn1 = _runsPerOver[0].isNotEmpty;
     final hasInn2 = _runsPerOver[1].isNotEmpty;
 
@@ -378,15 +372,15 @@ class _MatchSummaryScreenState extends State<MatchSummaryScreen>
       child: Row(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          if (hasInn1) _legendItem(_inn1Color, '1st Inn · ${widget.teamA}'),
+          if (hasInn1) _legendItem(c, _inn1Color, '1st Inn · ${widget.teamA}'),
           if (hasInn1 && hasInn2) const SizedBox(width: 24),
-          if (hasInn2) _legendItem(_inn2Color, '2nd Inn · ${widget.teamB}'),
+          if (hasInn2) _legendItem(c, _inn2Color, '2nd Inn · ${widget.teamB}'),
         ],
       ),
     );
   }
 
-  Widget _legendItem(Color color, String label) {
+  Widget _legendItem(AppColors c, Color color, String label) {
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
@@ -402,7 +396,7 @@ class _MatchSummaryScreenState extends State<MatchSummaryScreen>
         Text(
           label,
           style: GoogleFonts.rajdhani(
-            color: _textSecondary,
+            color: c.textSecondary,
             fontSize: 13,
             fontWeight: FontWeight.w600,
           ),
@@ -413,27 +407,27 @@ class _MatchSummaryScreenState extends State<MatchSummaryScreen>
 
   // ── Manhattan Chart ───────────────────────────────────────────────────────
 
-  Widget _buildManhattanTab() {
+  Widget _buildManhattanTab(AppColors c) {
     final hasData =
         _runsPerOver[0].isNotEmpty || _runsPerOver[1].isNotEmpty;
 
-    if (!hasData) return _buildNoData();
+    if (!hasData) return _buildNoData(c);
 
     return SingleChildScrollView(
       padding: const EdgeInsets.only(bottom: 32),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          _buildLegend(),
-          _buildSectionTitle('RUNS PER OVER'),
+          _buildLegend(c),
+          _buildSectionTitle(c, 'RUNS PER OVER'),
           const SizedBox(height: 8),
-          _buildManhattanChart(),
+          _buildManhattanChart(c),
         ],
       ),
     );
   }
 
-  Widget _buildManhattanChart() {
+  Widget _buildManhattanChart(AppColors c) {
     final map1 = _runsPerOver[0];
     final map2 = _runsPerOver[1];
 
@@ -481,9 +475,9 @@ class _MatchSummaryScreenState extends State<MatchSummaryScreen>
       margin: const EdgeInsets.symmetric(horizontal: 16),
       padding: const EdgeInsets.fromLTRB(8, 16, 16, 8),
       decoration: BoxDecoration(
-        color: _glassBg,
+        color: c.glassBg,
         borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: _glassBorder),
+        border: Border.all(color: c.glassBorder),
       ),
       height: 260,
       child: BarChart(
@@ -508,7 +502,7 @@ class _MatchSummaryScreenState extends State<MatchSummaryScreen>
                 getTitlesWidget: (val, _) => Text(
                   val.toInt().toString(),
                   style: GoogleFonts.rajdhani(
-                    color: _textSecondary,
+                    color: c.textSecondary,
                     fontSize: 11,
                   ),
                 ),
@@ -531,7 +525,7 @@ class _MatchSummaryScreenState extends State<MatchSummaryScreen>
                       // over number so display it directly.
                       '$over',
                       style: GoogleFonts.rajdhani(
-                        color: _textSecondary,
+                        color: c.textSecondary,
                         fontSize: 10,
                       ),
                     ),
@@ -553,7 +547,7 @@ class _MatchSummaryScreenState extends State<MatchSummaryScreen>
                 final innings = rodIndex == 0 ? '1st' : '2nd';
                 return BarTooltipItem(
                   'Over $over\n$innings: ${rod.toY.toInt()} runs',
-                  GoogleFonts.rajdhani(color: _textPrimary, fontSize: 12),
+                  GoogleFonts.rajdhani(color: c.textPrimary, fontSize: 12),
                 );
               },
             ),
@@ -565,27 +559,27 @@ class _MatchSummaryScreenState extends State<MatchSummaryScreen>
 
   // ── Worm Chart ────────────────────────────────────────────────────────────
 
-  Widget _buildWormTab() {
+  Widget _buildWormTab(AppColors c) {
     final hasData =
         _runsPerOver[0].isNotEmpty || _runsPerOver[1].isNotEmpty;
 
-    if (!hasData) return _buildNoData();
+    if (!hasData) return _buildNoData(c);
 
     return SingleChildScrollView(
       padding: const EdgeInsets.only(bottom: 32),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          _buildLegend(),
-          _buildSectionTitle('CUMULATIVE RUNS'),
+          _buildLegend(c),
+          _buildSectionTitle(c, 'CUMULATIVE RUNS'),
           const SizedBox(height: 8),
-          _buildWormChart(),
+          _buildWormChart(c),
         ],
       ),
     );
   }
 
-  Widget _buildWormChart() {
+  Widget _buildWormChart(AppColors c) {
     final cum1 = _cumulativeRuns(_runsPerOver[0]);
     final cum2 = _cumulativeRuns(_runsPerOver[1]);
 
@@ -644,9 +638,9 @@ class _MatchSummaryScreenState extends State<MatchSummaryScreen>
       margin: const EdgeInsets.symmetric(horizontal: 16),
       padding: const EdgeInsets.fromLTRB(8, 16, 16, 8),
       decoration: BoxDecoration(
-        color: _glassBg,
+        color: c.glassBg,
         borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: _glassBorder),
+        border: Border.all(color: c.glassBorder),
       ),
       height: 280,
       child: LineChart(
@@ -675,7 +669,7 @@ class _MatchSummaryScreenState extends State<MatchSummaryScreen>
                 getTitlesWidget: (val, _) => Text(
                   val.toInt().toString(),
                   style: GoogleFonts.rajdhani(
-                    color: _textSecondary,
+                    color: c.textSecondary,
                     fontSize: 11,
                   ),
                 ),
@@ -690,7 +684,7 @@ class _MatchSummaryScreenState extends State<MatchSummaryScreen>
                   child: Text(
                     'O${val.toInt()}',
                     style: GoogleFonts.rajdhani(
-                      color: _textSecondary,
+                      color: c.textSecondary,
                       fontSize: 10,
                     ),
                   ),
@@ -710,7 +704,7 @@ class _MatchSummaryScreenState extends State<MatchSummaryScreen>
                 final innings = spot.barIndex == 0 ? '1st' : '2nd';
                 return LineTooltipItem(
                   'Over $over · $innings\n${spot.y.toInt()} runs',
-                  GoogleFonts.rajdhani(color: _textPrimary, fontSize: 12),
+                  GoogleFonts.rajdhani(color: c.textPrimary, fontSize: 12),
                 );
               }).toList(),
             ),
@@ -722,7 +716,7 @@ class _MatchSummaryScreenState extends State<MatchSummaryScreen>
 
   // ── Shared helpers ────────────────────────────────────────────────────────
 
-  Widget _buildSectionTitle(String title) {
+  Widget _buildSectionTitle(AppColors c, String title) {
     return Padding(
       padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 4),
       child: Row(
@@ -731,7 +725,7 @@ class _MatchSummaryScreenState extends State<MatchSummaryScreen>
             width: 4,
             height: 18,
             decoration: BoxDecoration(
-              color: _accentGreen,
+              color: c.accentGreen,
               borderRadius: BorderRadius.circular(2),
             ),
           ),
@@ -741,7 +735,7 @@ class _MatchSummaryScreenState extends State<MatchSummaryScreen>
             style: GoogleFonts.rajdhani(
               fontSize: 13,
               fontWeight: FontWeight.w700,
-              color: _textSecondary,
+              color: c.textSecondary,
               letterSpacing: 2,
             ),
           ),
@@ -750,18 +744,18 @@ class _MatchSummaryScreenState extends State<MatchSummaryScreen>
     );
   }
 
-  Widget _buildNoData() {
+  Widget _buildNoData(AppColors c) {
     return Center(
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          Icon(Icons.bar_chart, size: 64, color: _accentGreen.withAlpha(100)),
+          Icon(Icons.bar_chart, size: 64, color: c.accentGreen.withAlpha(100)),
           const SizedBox(height: 16),
           Text(
             'No ball data yet',
             style: GoogleFonts.rajdhani(
               fontSize: 20,
-              color: _textSecondary,
+              color: c.textSecondary,
               fontWeight: FontWeight.w700,
             ),
           ),
@@ -985,13 +979,21 @@ class _MotmCard extends StatelessWidget {
   }
 
   Widget _buildAvatar() {
-    if (motm.avatarPath != null && motm.avatarPath!.isNotEmpty) {
-      final file = File(motm.avatarPath!);
+    final path = motm.avatarPath;
+    if (path != null && path.isNotEmpty) {
+      if (path.startsWith('http://') || path.startsWith('https://')) {
+        return CachedNetworkImage(
+          imageUrl: path,
+          fit: BoxFit.cover,
+          errorWidget: (ctx, url, e) => _placeholderIcon(),
+        );
+      }
+      final file = File(path);
       if (file.existsSync()) {
         return Image.file(
           file,
           fit: BoxFit.cover,
-          errorBuilder: (_, e, st) => _placeholderIcon(),
+          errorBuilder: (ctx, e, st) => _placeholderIcon(),
         );
       }
     }

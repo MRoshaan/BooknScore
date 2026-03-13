@@ -23,17 +23,19 @@ class SyncResult {
   final int matchesSynced;
   final int playersSynced;
   final int ballEventsSynced;
+  final int matchSummariesSynced;
   final List<String> errors;
 
   SyncResult({
     this.matchesSynced = 0,
     this.playersSynced = 0,
     this.ballEventsSynced = 0,
+    this.matchSummariesSynced = 0,
     this.errors = const [],
   });
 
   int get totalSynced =>
-      matchesSynced + playersSynced + ballEventsSynced;
+      matchesSynced + playersSynced + ballEventsSynced + matchSummariesSynced;
 
   bool get hasErrors => errors.isNotEmpty;
 }
@@ -88,8 +90,10 @@ class SyncService extends ChangeNotifier {
   static const _debounceDuration = Duration(seconds: 5);
   Timer? _debounceTimer;
 
-  // Guard against overlapping sync runs
+  // Guard against overlapping upward sync runs
   bool _isSyncing = false;
+  // Guard against overlapping downward sync runs
+  bool _isSyncingDown = false;
 
   // ══════════════════════════════════════════════════════════════════════════
   // INITIALIZATION
@@ -227,6 +231,7 @@ class SyncService extends ChangeNotifier {
     int matchesSynced = 0;
     int playersSynced = 0;
     int ballEventsSynced = 0;
+    int matchSummariesSynced = 0;
 
     try {
       // Log pending counts before syncing
@@ -248,24 +253,30 @@ class SyncService extends ChangeNotifier {
       );
 
       // Sync in strict dependency order:
-      //   1. players  (no FK dependencies)
-      //   2. matches  (depends on players only)
-      //   3. ball_events  (FK on matches — MUST wait for matches to land first)
+      //   0. teams       (no FK dependencies — must land before players reference team names)
+      //   1. players     (no FK dependencies)
+      //   2. tournaments (no FK dependencies; must land before matches reference them)
+      //   3. matches     (depends on players + tournaments; carries tournament_id UUID FK)
+      //   4. ball_events (FK on matches — MUST wait for matches to land first)
+      //   5. match_summaries (aggregated from ball_events; only for completed+synced matches)
       //
       // _syncMatches returns the set of match UUIDs that were confirmed written
       // to Supabase.  That set is passed directly into _syncBallEvents so it
       // can gate each event against it and avoid FK violations (code 23503).
+      await _syncTeams(errors);
       playersSynced = await _syncPlayers(errors);
+      await _syncTournaments(errors);
       final matchResult = await _syncMatches(errors);
       matchesSynced = matchResult.count;
       ballEventsSynced = await _syncBallEvents(errors, matchResult.syncedUuids);
+      matchSummariesSynced = await _syncMatchSummaries(errors);
 
       _lastSyncTime = DateTime.now();
 
       if (errors.isEmpty) {
         developer.log(
           'syncAll: completed successfully — '
-          'total=${playersSynced + matchesSynced + ballEventsSynced}',
+          'total=${playersSynced + matchesSynced + ballEventsSynced + matchSummariesSynced}',
           name: 'SyncService',
         );
         _setState(SyncState.synced);
@@ -292,6 +303,7 @@ class SyncService extends ChangeNotifier {
       matchesSynced: matchesSynced,
       playersSynced: playersSynced,
       ballEventsSynced: ballEventsSynced,
+      matchSummariesSynced: matchSummariesSynced,
       errors: errors,
     );
   }
@@ -299,6 +311,66 @@ class SyncService extends ChangeNotifier {
   // ══════════════════════════════════════════════════════════════════════════
   // SYNC INDIVIDUAL TABLES
   // ══════════════════════════════════════════════════════════════════════════
+
+  /// Sync unsynced teams to Supabase in a single batch upsert.
+  ///
+  /// Only rows with [sync_status] == 0 are pushed; already-synced rows are
+  /// skipped to keep the payload minimal.  After a successful upsert every
+  /// pushed row is marked [sync_status] = 1 locally.
+  Future<void> _syncTeams(List<String> errors) async {
+    try {
+      final unsynced = await _db.fetchUnsyncedTeams();
+      if (unsynced.isEmpty) return;
+
+      final payloads = <Map<String, dynamic>>[];
+      final ids      = <int>[];
+
+      for (final t in unsynced) {
+        final uuid = (t[DatabaseHelper.colTeamUuid] as String? ?? '').trim();
+        if (uuid.isEmpty) continue;
+        payloads.add({
+          'id':         uuid,
+          'name':       t[DatabaseHelper.colName]       as String? ?? '',
+          'created_at': t[DatabaseHelper.colCreatedAt]  as String?
+              ?? DateTime.now().toIso8601String(),
+          'created_by': t[DatabaseHelper.colCreatedBy]  as String?,
+        });
+        ids.add(t[DatabaseHelper.colId] as int);
+      }
+
+      if (payloads.isEmpty) return;
+
+      try {
+        await _supabase.from('teams').upsert(payloads, ignoreDuplicates: false);
+        // Mark as synced locally.
+        for (final id in ids) {
+          await _db.markTeamSynced(id);
+        }
+        developer.log(
+          '_syncTeams: upserted ${payloads.length} team(s)',
+          name: 'SyncService',
+        );
+      } on PostgrestException catch (e, st) {
+        developer.log(
+          '_syncTeams: upsert failed',
+          name: 'SyncService',
+          error: e,
+          stackTrace: st,
+          level: 1000,
+        );
+        errors.add('Failed to sync teams: ${e.message}');
+      }
+    } catch (e, st) {
+      developer.log(
+        '_syncTeams: unexpected failure',
+        name: 'SyncService',
+        error: e,
+        stackTrace: st,
+        level: 1000,
+      );
+      errors.add('Failed to sync teams: $e');
+    }
+  }
 
   /// Sync ALL local players to Supabase in a single batch upsert.
   ///
@@ -339,45 +411,75 @@ class SyncService extends ChangeNotifier {
         final playerUuid = player[DatabaseHelper.colUuid] as String;
         final localAvatarPath = player[DatabaseHelper.colLocalAvatarPath] as String?;
 
-        // Upload avatar to Supabase Storage if a local file exists.
+        // Resolve the avatar_url to send to Supabase:
+        //   • If local_avatar_path is already an https:// URL (uploaded at
+        //     save-time by _submit()), use it directly — no re-upload needed.
+        //   • If it is a local file path, upload it now and use the public URL.
+        //   • If there is no avatar at all, omit avatar_url from the payload
+        //     so the existing Supabase value is never overwritten with null.
         String? avatarUrl;
         if (localAvatarPath != null && localAvatarPath.isNotEmpty) {
-          try {
-            final file = File(localAvatarPath);
-            if (await file.exists()) {
-              final timestamp = DateTime.now().millisecondsSinceEpoch;
-              final storagePath = 'avatars/${playerId}_$timestamp.jpg';
-              await _supabase.storage.from('avatars').upload(
-                storagePath,
-                file,
-                fileOptions: const FileOptions(
-                  contentType: 'image/jpeg',
-                  upsert: true,
-                ),
+          final isAlreadyUrl = localAvatarPath.startsWith('http://') ||
+              localAvatarPath.startsWith('https://');
+
+          if (isAlreadyUrl) {
+            // Already a public URL — use as-is, no Storage upload needed.
+            avatarUrl = localAvatarPath;
+          } else {
+            // Local file path — upload to Storage and get the public URL.
+            try {
+              final file = File(localAvatarPath);
+              if (await file.exists()) {
+                final timestamp = DateTime.now().millisecondsSinceEpoch;
+                final storagePath = 'avatars/${playerId}_$timestamp.jpg';
+                await _supabase.storage.from('avatars').upload(
+                  storagePath,
+                  file,
+                  fileOptions: const FileOptions(
+                    contentType: 'image/jpeg',
+                    upsert: true,
+                  ),
+                );
+                avatarUrl = _supabase.storage.from('avatars').getPublicUrl(storagePath);
+
+                // Persist the URL back to SQLite so future syncs skip the
+                // file upload and use the URL path directly.
+                final db2 = await _db.database;
+                await db2.update(
+                  DatabaseHelper.tablePlayers,
+                  {DatabaseHelper.colLocalAvatarPath: avatarUrl},
+                  where: '${DatabaseHelper.colId} = ?',
+                  whereArgs: [playerId],
+                );
+              }
+            } catch (e, st) {
+              // Avatar upload failure is non-fatal; log and continue.
+              developer.log(
+                'Avatar upload failed for player id=$playerId',
+                name: 'SyncService',
+                error: e,
+                stackTrace: st,
+                level: 800,
               );
-              avatarUrl = _supabase.storage.from('avatars').getPublicUrl(storagePath);
             }
-          } catch (e, st) {
-            // Avatar upload failure is non-fatal; log and continue.
-            developer.log(
-              'Avatar upload failed for player id=$playerId',
-              name: 'SyncService',
-              error: e,
-              stackTrace: st,
-              level: 800,
-            );
           }
         }
 
-        // Include 'id' (UUID) so Supabase can upsert on the primary key —
-        // without it every call would insert a new row and throw a duplicate.
-        payloads.add(<String, dynamic>{
-          'id':         playerUuid,
-          'name':       player[DatabaseHelper.colName],
-          'team':       player[DatabaseHelper.colTeam],
-          'role':       player[DatabaseHelper.colRole],
-          'avatar_url': avatarUrl,
-        });
+        // Build the upsert payload.  Include 'id' (UUID) so Supabase can
+        // match on the primary key and update rather than insert duplicates.
+        // Only add avatar_url when we actually have a value — sending null
+        // would blank out an avatar that was set on another device.
+        final payload = <String, dynamic>{
+          'id':           playerUuid,
+          'name':         player[DatabaseHelper.colName],
+          'team':         player[DatabaseHelper.colTeam],
+          'role':         player[DatabaseHelper.colRole],
+          'bowling_type': player[DatabaseHelper.colBowlingType],
+        };
+        if (avatarUrl != null) {
+          payload['avatar_url'] = avatarUrl;
+        }
+        payloads.add(payload);
 
         if ((player[DatabaseHelper.colSyncStatus] as int) == 0) {
           unsyncedIds.add(playerId);
@@ -436,6 +538,68 @@ class SyncService extends ChangeNotifier {
     return synced;
   }
 
+  /// Sync all local tournaments to Supabase in a single batch upsert.
+  ///
+  /// Every tournament row is upserted (not just unsynced ones) to ensure the
+  /// remote copy stays current with name / status / winner changes.
+  /// The `uuid` column (added in DB v16) is used as the Supabase PK.
+  Future<void> _syncTournaments(List<String> errors) async {
+    try {
+      final db = await _db.database;
+
+      final rows = await db.query(DatabaseHelper.tableTournaments);
+      if (rows.isEmpty) return;
+
+      final payloads = <Map<String, dynamic>>[];
+
+      for (final t in rows) {
+        final uuid = (t[DatabaseHelper.colTournamentUuid] as String? ?? '').trim();
+        if (uuid.isEmpty) continue; // skip rows without a UUID (pre-v16 edge case)
+
+        payloads.add({
+          'id':              uuid,
+          'name':            t[DatabaseHelper.colName],
+          'format':          t[DatabaseHelper.colFormat],
+          'overs_per_match': t[DatabaseHelper.colOversPerMatch],
+          'teams':           t[DatabaseHelper.colTeams],
+          'status':          t[DatabaseHelper.colStatus],
+          'created_at':      t[DatabaseHelper.colCreatedAt],
+          'created_by':      t[DatabaseHelper.colCreatedBy],
+        });
+      }
+
+      if (payloads.isEmpty) return;
+
+      try {
+        await _supabase
+            .from('tournaments')
+            .upsert(payloads, ignoreDuplicates: false);
+        developer.log(
+          '_syncTournaments: upserted ${payloads.length} tournament(s)',
+          name: 'SyncService',
+        );
+      } on PostgrestException catch (e, st) {
+        developer.log(
+          '_syncTournaments: upsert failed',
+          name: 'SyncService',
+          error: e,
+          stackTrace: st,
+          level: 1000,
+        );
+        errors.add('Failed to sync tournaments: ${e.message}');
+      }
+    } catch (e, st) {
+      developer.log(
+        '_syncTournaments: unexpected failure',
+        name: 'SyncService',
+        error: e,
+        stackTrace: st,
+        level: 1000,
+      );
+      errors.add('Failed to sync tournaments: $e');
+    }
+  }
+
   /// Sync unsynced matches to Supabase in a single batch upsert.
   ///
   /// Returns a record with:
@@ -488,18 +652,37 @@ class SyncService extends ChangeNotifier {
           }
         }
 
+        // Resolve tournament_id: local DB stores an INTEGER FK; Supabase
+        // expects the tournament's UUID string (tournaments.uuid).
+        final tournLocalId = match[DatabaseHelper.colTournamentId] as int?;
+        String? tournamentUuid;
+        if (tournLocalId != null) {
+          final db = await _db.database;
+          final tRows = await db.query(
+            DatabaseHelper.tableTournaments,
+            columns: [DatabaseHelper.colTournamentUuid],
+            where: '${DatabaseHelper.colId} = ?',
+            whereArgs: [tournLocalId],
+            limit: 1,
+          );
+          if (tRows.isNotEmpty) {
+            final u = tRows.first[DatabaseHelper.colTournamentUuid] as String? ?? '';
+            tournamentUuid = u.isEmpty ? null : u;
+          }
+        }
+
         payloads.add({
-          'id':              matchUuid,                               // UUID string as Supabase PK
-          'team_a':          match[DatabaseHelper.colTeamA],
-          'team_b':          match[DatabaseHelper.colTeamB],
-          'overs':           match[DatabaseHelper.colTotalOvers], // total_overs → overs
-          'toss_winner':     match[DatabaseHelper.colTossWinner],
-          'toss_decision':   match[DatabaseHelper.colOptTo],       // opt_to → toss_decision
-          'status':          match[DatabaseHelper.colStatus],
-          'tournament_name': match[DatabaseHelper.colTournamentName],
-          'winner':          match[DatabaseHelper.colWinner],
-          'created_by':      match[DatabaseHelper.colCreatedBy],  // required by RLS / NOT NULL constraint
-          'motm_player_id':  motmPlayerUuid,                      // NULL until match completes
+          'id':             matchUuid,           // UUID string as Supabase PK
+          'team_a':         match[DatabaseHelper.colTeamA],
+          'team_b':         match[DatabaseHelper.colTeamB],
+          'overs':          match[DatabaseHelper.colTotalOvers], // total_overs → overs
+          'toss_winner':    match[DatabaseHelper.colTossWinner],
+          'toss_decision':  match[DatabaseHelper.colOptTo],      // opt_to → toss_decision
+          'status':         match[DatabaseHelper.colStatus],
+          'tournament_id':  tournamentUuid,       // UUID FK → tournaments.id, nullable
+          'winner':         match[DatabaseHelper.colWinner],
+          'created_by':     match[DatabaseHelper.colCreatedBy],  // required by RLS / NOT NULL
+          'motm_player_id': motmPlayerUuid,       // NULL until match completes
         });
         syncedIds.add(matchId);
         uuids.add(matchUuid);
@@ -703,6 +886,7 @@ class SyncService extends ChangeNotifier {
             'batter_runs':    runsScored,
             'is_wicket':      (event[DatabaseHelper.colIsWicket]   as int? ?? 0) == 1,
             'is_boundary':    (event[DatabaseHelper.colIsBoundary] as int? ?? 0) == 1,
+            'is_free_hit':    false,  // schema column; free-hit not yet tracked locally, defaults to false
             'dismissal_type': event[DatabaseHelper.colWicketType],
             'extra_type':     event[DatabaseHelper.colExtraType],
             'extra_runs':     extraRuns,
@@ -710,7 +894,7 @@ class SyncService extends ChangeNotifier {
             'non_striker':    playerUuid(event[DatabaseHelper.colNonStrikerId] as int?),
             'bowler':         playerUuid(event[DatabaseHelper.colBowlerId] as int?),
             'player_out':     playerUuid(event[DatabaseHelper.colOutPlayerId] as int?),
-            'created_by':     event[DatabaseHelper.colCreatedBy],
+            'created_by':     event[DatabaseHelper.colCreatedBy] as String?,
             'outcome':        null,
             'crossed':        false,
           };
@@ -814,6 +998,236 @@ class SyncService extends ChangeNotifier {
   }
 
   // ══════════════════════════════════════════════════════════════════════════
+  // MATCH SUMMARIES SYNC
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /// For every completed match that has already been confirmed in Supabase
+  /// (sync_status = 1 in the local matches table), compute per-player batting
+  /// and bowling aggregates from local ball_events and upsert one row per
+  /// player into the Supabase `match_summaries` table.
+  ///
+  /// Schema expected on the Supabase side:
+  ///   match_id       text    (FK → matches.id, the UUID string)
+  ///   player_name    text
+  ///   runs           int4
+  ///   wickets        int4
+  ///   impact_score   float8
+  ///   team_a         text
+  ///   team_b         text
+  ///   winner         text
+  ///   tournament_id   uuid FK → tournaments.id (nullable)
+  Future<int> _syncMatchSummaries(List<String> errors) async {
+    int synced = 0;
+    try {
+      final db = await _db.database;
+
+      // Only process completed matches that are already confirmed in Supabase.
+      final completedSynced = await db.query(
+        DatabaseHelper.tableMatches,
+        where:
+            '${DatabaseHelper.colStatus} = ? AND ${DatabaseHelper.colSyncStatus} = 1',
+        whereArgs: ['completed'],
+      );
+
+      if (completedSynced.isEmpty) return 0;
+
+      final payloads = <Map<String, dynamic>>[];
+
+      for (final match in completedSynced) {
+        final matchIntId  = match[DatabaseHelper.colId]             as int;
+        final matchUuid   = match[DatabaseHelper.colUuid]           as String;
+        final teamA       = match[DatabaseHelper.colTeamA]          as String;
+        final teamB       = match[DatabaseHelper.colTeamB]          as String;
+        final winner         = match[DatabaseHelper.colWinner]      as String?;
+        final localTournId   = match[DatabaseHelper.colTournamentId] as int?;
+
+        if (matchUuid.isEmpty) continue; // no UUID yet — skip
+
+        // Resolve local tournament int id → Supabase UUID string (nullable).
+        String? tournamentUuid;
+        if (localTournId != null) {
+          final tRows = await db.query(
+            DatabaseHelper.tableTournaments,
+            columns: [DatabaseHelper.colTournamentUuid],
+            where: '${DatabaseHelper.colId} = ?',
+            whereArgs: [localTournId],
+            limit: 1,
+          );
+          if (tRows.isNotEmpty) {
+            tournamentUuid = tRows.first[DatabaseHelper.colTournamentUuid] as String?;
+          }
+        }
+
+        // Fetch all ball_events for this match (both innings).
+        final events = await db.query(
+          DatabaseHelper.tableBallEvents,
+          where: '${DatabaseHelper.colMatchId} = ?',
+          whereArgs: [matchIntId],
+        );
+        if (events.isEmpty) continue;
+
+        // Collect all unique player int IDs referenced in this match.
+        final playerIds = <int>{};
+        for (final e in events) {
+          for (final col in [
+            DatabaseHelper.colStrikerId,
+            DatabaseHelper.colNonStrikerId,
+            DatabaseHelper.colBowlerId,
+            DatabaseHelper.colOutPlayerId,
+          ]) {
+            final v = e[col];
+            if (v != null) playerIds.add(v as int);
+          }
+        }
+
+        // Build a map of player int id → {name, uuid}.
+        final playerInfo = <int, Map<String, String?>>{};
+        for (final pid in playerIds) {
+          final rows = await db.query(
+            DatabaseHelper.tablePlayers,
+            columns: [
+              DatabaseHelper.colName,
+              DatabaseHelper.colUuid,
+            ],
+            where: '${DatabaseHelper.colId} = ?',
+            whereArgs: [pid],
+            limit: 1,
+          );
+          if (rows.isNotEmpty) {
+            playerInfo[pid] = {
+              'name': rows.first[DatabaseHelper.colName] as String?,
+              'uuid': rows.first[DatabaseHelper.colUuid] as String?,
+            };
+          }
+        }
+
+        // Aggregate per-player stats across both innings.
+        final batRuns    = <int, int>{};   // player id → runs scored as batter
+        final bowWickets = <int, int>{};   // player id → wickets taken as bowler
+
+        for (final e in events) {
+          final strikerId = e[DatabaseHelper.colStrikerId] as int?;
+          final bowlerId  = e[DatabaseHelper.colBowlerId]  as int?;
+          final extraType = e[DatabaseHelper.colExtraType] as String?;
+          final runs      = (e[DatabaseHelper.colRunsScored] as int?) ?? 0;
+          final isWicket  = ((e[DatabaseHelper.colIsWicket] as int?) ?? 0) == 1;
+          final wicketType = e[DatabaseHelper.colWicketType] as String?;
+
+          // Batting runs (exclude byes/leg-byes credited to the batter).
+          if (strikerId != null &&
+              extraType != 'bye' &&
+              extraType != 'leg_bye') {
+            batRuns[strikerId] = (batRuns[strikerId] ?? 0) + runs;
+          }
+
+          // Bowling wickets (exclude run-outs from bowler's tally).
+          if (bowlerId != null && isWicket && wicketType != 'run_out') {
+            bowWickets[bowlerId] = (bowWickets[bowlerId] ?? 0) + 1;
+          }
+        }
+
+        // Build one payload row per player.
+        for (final pid in playerIds) {
+          final info = playerInfo[pid];
+
+          // ── Strict UUID guard ────────────────────────────────────────────
+          // A blank or malformed UUID would cause a Postgres FK / type error.
+          // The UUID regex requires the canonical 8-4-4-4-12 hex format.
+          final uuidPattern = RegExp(
+            r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
+            caseSensitive: false,
+          );
+          if (!uuidPattern.hasMatch(matchUuid)) {
+            developer.log(
+              '_syncMatchSummaries: skipping match $matchIntId — '
+              'invalid UUID "$matchUuid"',
+              name: 'SyncService',
+              level: 800,
+            );
+            break; // skip every player row for this match
+          }
+
+          // ── Type-safe text fields ─────────────────────────────────────────
+          final rawName    = info?['name'];
+          final playerName = (rawName != null && rawName.trim().isNotEmpty)
+              ? rawName
+              : 'Player $pid';
+          final safeTeamA   = teamA.isNotEmpty  ? teamA  : 'Unknown';
+          final safeTeamB   = teamB.isNotEmpty  ? teamB  : 'Unknown';
+          final safeWinner  = (winner  != null && winner.isNotEmpty)   ? winner   : null;
+
+          // ── Explicit int4 casts ───────────────────────────────────────────
+          // Supabase expects int4 for runs, wickets, impact_score.
+          // All three are computed from integer arithmetic; .toInt() is a
+          // safety net in case Dart ever widens them to num/double.
+          final runsInt    = (batRuns[pid]    ?? 0).toInt();
+          final wicketsInt = (bowWickets[pid] ?? 0).toInt();
+          final impactInt  = (runsInt + wicketsInt * 20); // pure int, no double
+
+          payloads.add({
+            'match_id':        matchUuid,       // validated UUID string → FK matches.id
+            'player_name':     playerName,      // text NOT NULL
+            'runs':            runsInt,         // int4
+            'wickets':         wicketsInt,      // int4
+            'impact_score':    impactInt,       // int4 (no decimal sent)
+            'team_a':          safeTeamA,       // text
+            'team_b':          safeTeamB,       // text
+            'winner':          safeWinner,      // text, nullable
+            'tournament_id':   tournamentUuid,  // uuid FK, nullable
+          });
+        }
+      }
+
+      if (payloads.isEmpty) return 0;
+
+      // Upsert in chunks of 200.
+      const chunkSize = 200;
+      for (int i = 0; i < payloads.length; i += chunkSize) {
+        final chunk = payloads.sublist(
+          i, (i + chunkSize).clamp(0, payloads.length),
+        );
+        try {
+          await _supabase
+              .from('match_summaries')
+              .upsert(chunk, ignoreDuplicates: false);
+          synced += chunk.length;
+        } on PostgrestException catch (pgErr) {
+          // Log the exact Postgres error so the precise column / constraint
+          // violation is visible in the debug console.
+          developer.log(
+            '_syncMatchSummaries: PostgrestException on chunk '
+            '${i ~/ chunkSize + 1}\n'
+            '  message : ${pgErr.message}\n'
+            '  details : ${pgErr.details}\n'
+            '  hint    : ${pgErr.hint}\n'
+            '  code    : ${pgErr.code}',
+            name: 'SyncService',
+            level: 900,
+          );
+          errors.add('match_summaries upsert failed (chunk ${i ~/ chunkSize + 1}): '
+              '${pgErr.message} — ${pgErr.details}');
+          // Continue trying remaining chunks rather than aborting entirely.
+        }
+      }
+
+      developer.log(
+        '_syncMatchSummaries: upserted $synced row(s)',
+        name: 'SyncService',
+      );
+    } catch (e, st) {
+      developer.log(
+        '_syncMatchSummaries: unexpected failure',
+        name: 'SyncService',
+        error: e,
+        stackTrace: st,
+        level: 900,
+      );
+      errors.add('match_summaries sync failed: $e');
+    }
+    return synced;
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
   // HELPERS
   // ══════════════════════════════════════════════════════════════════════════
 
@@ -867,39 +1281,56 @@ class SyncService extends ChangeNotifier {
   // DOWNWARD SYNC (Supabase → local SQLite)
   // ══════════════════════════════════════════════════════════════════════════
 
-  /// Pull initial data from Supabase into the local SQLite database.
+  /// Pull the full community dataset from Supabase into local SQLite.
   ///
-  /// Runs automatically after sign-in when the local `players` table is empty,
-  /// or can be force-called by passing [force] = true.
+  /// Runs automatically on every sign-in event (via [AuthService]) with
+  /// [force] = true, and is called by the Dashboard on every mount so that
+  /// community matches created by other users are always visible.
   ///
-  /// Uses `INSERT OR IGNORE` so existing local rows are never overwritten —
-  /// local data always wins, which preserves any offline changes made before
-  /// the user first signed in.
+  /// Insertion order (FK-safe):
+  ///   1. players
+  ///   2. matches
+  ///   3. ball_events  (requires players + matches to exist first)
   ///
-  /// Tables synced (in FK-safe order): teams → players → matches.
-  /// `ball_events` are intentionally excluded from the initial pull; they are
-  /// large and not needed for the roster autocomplete use-case that motivated
-  /// this feature.
+  /// All inserts use [ConflictAlgorithm.replace] so that:
+  ///   - A fresh install (empty DB) inserts everything normally.
+  ///   - A forced re-sync updates stale rows rather than silently skipping them.
+  ///   - Re-installing the app never causes UNIQUE-constraint failures on uuid.
+  ///
+  /// When [force] is false the sync is skipped if the local players table
+  /// already has rows (cheap guard for normal app restarts).
   Future<void> syncDownInitialData({bool force = false}) async {
+    // Prevent concurrent downward sync runs (auth event + dashboard both
+    // calling this simultaneously caused duplicate inserts before the UNIQUE
+    // index was in place; keep the guard for extra safety).
+    if (_isSyncingDown) {
+      developer.log(
+        'syncDownInitialData: skipped — downward sync already in progress',
+        name: 'SyncService',
+      );
+      return;
+    }
+    _isSyncingDown = true;
     try {
       final db = await _db.database;
 
-      // Guard: skip unless forced or local players table is empty.
+      // ── Guard ────────────────────────────────────────────────────────────
       if (!force) {
         final count = Sqflite.firstIntValue(
-              await db.rawQuery('SELECT COUNT(*) FROM ${DatabaseHelper.tablePlayers}'),
+              await db.rawQuery(
+                  'SELECT COUNT(*) FROM ${DatabaseHelper.tablePlayers}'),
             ) ??
             0;
         if (count > 0) {
           developer.log(
-            'syncDownInitialData: skipped — local players table not empty (count=$count)',
+            'syncDownInitialData: skipped — local players not empty (count=$count)',
             name: 'SyncService',
           );
           return;
         }
       }
 
-      // Require authentication.
+      // ── Auth ─────────────────────────────────────────────────────────────
       final userId = AuthService.instance.currentUser?.id;
       if (userId == null) {
         developer.log(
@@ -910,7 +1341,7 @@ class SyncService extends ChangeNotifier {
         return;
       }
 
-      // Require connectivity.
+      // ── Connectivity ─────────────────────────────────────────────────────
       final isOnline = await _checkConnectivity();
       if (!isOnline) {
         developer.log(
@@ -920,31 +1351,99 @@ class SyncService extends ChangeNotifier {
         return;
       }
 
-      developer.log('syncDownInitialData: starting pull from Supabase', name: 'SyncService');
+      developer.log(
+        'syncDownInitialData: starting pull from Supabase (force=$force)',
+        name: 'SyncService',
+      );
 
-      // ── 1. Players ───────────────────────────────────────────────────────
+      _setState(SyncState.syncing);
+
+      // ══════════════════════════════════════════════════════════════════════
+      // 0. TEAMS  (no FK deps — pull before players)
+      // ══════════════════════════════════════════════════════════════════════
+      int teamsInserted = 0;
       try {
-        final remotePlayers = await _supabase.from('players').select();
-        int playersInserted = 0;
+        final remoteTeams =
+            await _supabase.from('teams').select() as List<dynamic>;
+
         await db.transaction((txn) async {
-          for (final p in remotePlayers as List<dynamic>) {
-            final row = p as Map<String, dynamic>;
-            final inserted = await txn.insert(
-              DatabaseHelper.tablePlayers,
+          for (final t in remoteTeams) {
+            final row  = t as Map<String, dynamic>;
+            final uuid = row['id'] as String? ?? '';
+            if (uuid.isEmpty) continue;
+            final n = await txn.insert(
+              DatabaseHelper.tableTeams,
               {
-                DatabaseHelper.colUuid:   row['id']   as String? ?? '',
-                DatabaseHelper.colName:   row['name'] as String? ?? '',
-                DatabaseHelper.colTeam:   row['team'] as String? ?? '',
-                DatabaseHelper.colRole:   row['role'] as String? ?? 'Batsman',
-                DatabaseHelper.colSyncStatus: 1, // already in Supabase
+                DatabaseHelper.colTeamUuid:  uuid,
+                DatabaseHelper.colName:      row['name']       as String? ?? '',
+                DatabaseHelper.colSyncStatus: 1,
+                DatabaseHelper.colCreatedAt: row['created_at'] as String?
+                    ?? DateTime.now().toIso8601String(),
+                DatabaseHelper.colCreatedBy: row['created_by'] as String?,
               },
-              conflictAlgorithm: ConflictAlgorithm.ignore,
+              conflictAlgorithm: ConflictAlgorithm.replace,
             );
-            if (inserted > 0) playersInserted++;
+            if (n > 0) teamsInserted++;
           }
         });
         developer.log(
-          'syncDownInitialData: inserted $playersInserted/${(remotePlayers as List).length} player(s)',
+          'syncDownInitialData: upserted $teamsInserted/${remoteTeams.length} team(s)',
+          name: 'SyncService',
+        );
+      } catch (e, st) {
+        developer.log(
+          'syncDownInitialData: failed to pull teams',
+          name: 'SyncService',
+          error: e,
+          stackTrace: st,
+          level: 900,
+        );
+        // Non-fatal — continue with players.
+      }
+
+      // ══════════════════════════════════════════════════════════════════════
+      // 1. PLAYERS
+      // ══════════════════════════════════════════════════════════════════════
+      int playersInserted = 0;
+      try {
+        final remotePlayers =
+            await _supabase.from('players').select() as List<dynamic>;
+
+        await db.transaction((txn) async {
+          for (final p in remotePlayers) {
+            final row = p as Map<String, dynamic>;
+
+            // Prefer the remote avatar_url when syncing down so that avatars
+            // uploaded from any device (or set via the web dashboard) are
+            // reflected locally.  ConflictAlgorithm.replace means if a row
+            // already exists, its local_avatar_path is replaced with the
+            // remote avatar_url value — which is fine because _submit() now
+            // stores the public URL (not a local path) in local_avatar_path.
+            final remoteAvatarUrl = row['avatar_url'] as String?;
+
+            final n = await txn.insert(
+              DatabaseHelper.tablePlayers,
+              {
+                DatabaseHelper.colUuid:            row['id']           as String? ?? '',
+                DatabaseHelper.colName:            row['name']         as String? ?? '',
+                DatabaseHelper.colTeam:            row['team']         as String? ?? '',
+                DatabaseHelper.colRole:            row['role']         as String?,
+                DatabaseHelper.colBowlingType:     row['bowling_type'] as String?,
+                DatabaseHelper.colLocalAvatarPath: remoteAvatarUrl,
+                DatabaseHelper.colSyncStatus:      1,
+                // NOT NULL — fall back to current time if Supabase omits it.
+                DatabaseHelper.colCreatedAt:
+                    row['created_at'] as String? ??
+                    DateTime.now().toIso8601String(),
+                DatabaseHelper.colCreatedBy:       row['created_by']  as String?,
+              },
+              conflictAlgorithm: ConflictAlgorithm.replace,
+            );
+            if (n > 0) playersInserted++;
+          }
+        });
+        developer.log(
+          'syncDownInitialData: upserted $playersInserted/${remotePlayers.length} player(s)',
           name: 'SyncService',
         );
       } catch (e, st) {
@@ -955,39 +1454,209 @@ class SyncService extends ChangeNotifier {
           stackTrace: st,
           level: 900,
         );
+        // Bail — ball_events need players to be present first.
+        _setState(SyncState.error);
+        return;
       }
 
-      // ── 2. Matches ───────────────────────────────────────────────────────
+      // ══════════════════════════════════════════════════════════════════════
+      // 2. TOURNAMENTS  (global — all communities)
+      // ══════════════════════════════════════════════════════════════════════
+      //
+      // Must run before matches so that tournament_id FKs on matches can be
+      // resolved later if we ever migrate matches to store a proper FK.
+      int tournamentsInserted = 0;
+      // uuid → local auto-increment id, needed to resolve tournament_teams FK.
+      final Map<String, int> tournamentUuidToLocalId = {};
+
       try {
-        final remoteMatches = await _supabase
-            .from('matches')
-            .select();
-        int matchesInserted = 0;
+        final remoteTournaments =
+            await _supabase.from('tournaments').select() as List<dynamic>;
+
         await db.transaction((txn) async {
-          for (final m in remoteMatches as List<dynamic>) {
+          for (final t in remoteTournaments) {
+            final row = t as Map<String, dynamic>;
+            final tUuid = row['id'] as String? ?? '';
+            if (tUuid.isEmpty) continue;
+
+            final n = await txn.insert(
+              DatabaseHelper.tableTournaments,
+              {
+                DatabaseHelper.colTournamentUuid: tUuid,
+                DatabaseHelper.colName:           row['name']           as String? ?? '',
+                DatabaseHelper.colFormat:         row['format']         as String? ?? 'league',
+                DatabaseHelper.colOversPerMatch:  row['overs_per_match'] as int?   ?? 20,
+                DatabaseHelper.colTeams:          row['teams']          as String? ?? '',
+                DatabaseHelper.colStatus:         row['status']         as String? ?? 'active',
+                DatabaseHelper.colCreatedAt:      row['created_at']     as String?
+                    ?? DateTime.now().toIso8601String(),
+                DatabaseHelper.colCreatedBy:      row['created_by']     as String?,
+              },
+              conflictAlgorithm: ConflictAlgorithm.replace,
+            );
+            if (n > 0) tournamentsInserted++;
+          }
+        });
+
+        // Rebuild uuid→localId from live DB (REPLACE may change rowids).
+        final freshTRows = await db.query(
+          DatabaseHelper.tableTournaments,
+          columns: [DatabaseHelper.colId, DatabaseHelper.colTournamentUuid],
+        );
+        for (final r in freshTRows) {
+          final u = r[DatabaseHelper.colTournamentUuid] as String? ?? '';
+          if (u.isNotEmpty) {
+            tournamentUuidToLocalId[u] = r[DatabaseHelper.colId] as int;
+          }
+        }
+
+        developer.log(
+          'syncDownInitialData: upserted $tournamentsInserted/${remoteTournaments.length} tournament(s)',
+          name: 'SyncService',
+        );
+      } catch (e, st) {
+        developer.log(
+          'syncDownInitialData: failed to pull tournaments',
+          name: 'SyncService',
+          error: e,
+          stackTrace: st,
+          level: 900,
+        );
+        // Non-fatal — continue with matches even if tournaments fail.
+      }
+
+      // ══════════════════════════════════════════════════════════════════════
+      // 3. TOURNAMENT TEAMS
+      // ══════════════════════════════════════════════════════════════════════
+      //
+      // Supabase tournament_teams rows: { tournament_id (uuid FK), team_name,
+      // is_eliminated (bool) }
+      int tournamentTeamsInserted = 0;
+      try {
+        final remoteTTeams =
+            await _supabase.from('tournament_teams').select() as List<dynamic>;
+
+        await db.transaction((txn) async {
+          for (final t in remoteTTeams) {
+            final row = t as Map<String, dynamic>;
+            final tUuid = row['tournament_id'] as String? ?? '';
+            final localTournamentId = tournamentUuidToLocalId[tUuid];
+            if (localTournamentId == null) continue; // unknown tournament — skip
+
+            final n = await txn.insert(
+              DatabaseHelper.tableTournamentTeams,
+              {
+                DatabaseHelper.colTournamentId: localTournamentId,
+                DatabaseHelper.colTeamName:     row['team_name']     as String? ?? '',
+                DatabaseHelper.colIsEliminated: (row['is_eliminated'] as bool? ?? false) ? 1 : 0,
+              },
+              conflictAlgorithm: ConflictAlgorithm.replace,
+            );
+            if (n > 0) tournamentTeamsInserted++;
+          }
+        });
+
+        developer.log(
+          'syncDownInitialData: upserted $tournamentTeamsInserted/${remoteTTeams.length} tournament_team(s)',
+          name: 'SyncService',
+        );
+      } catch (e, st) {
+        developer.log(
+          'syncDownInitialData: failed to pull tournament_teams',
+          name: 'SyncService',
+          error: e,
+          stackTrace: st,
+          level: 900,
+        );
+        // Non-fatal.
+      }
+
+      // ══════════════════════════════════════════════════════════════════════
+      // 4. MATCHES  (global — no created_by filter)
+      // ══════════════════════════════════════════════════════════════════════
+      //
+      // Quick Matches have tournament_id IS NULL.
+      // Tournament matches carry a non-null tournament_id UUID FK.
+      // We download ALL matches and resolve tournament UUID → local int.
+      int matchesInserted = 0;
+      // Also build a uuid→localId map needed for ball_events below.
+      final Map<String, int> matchUuidToLocalId = {};
+
+      try {
+        // ── Scalable fetch: all live + last 50 completed ──────────────────
+        // Fetching every match ever played would OOM at scale.
+        // Strategy:
+        //   1. All ongoing matches (never miss a live score).
+        //   2. Most recent 50 completed matches (bounded history).
+        // The two lists are merged and de-duplicated by UUID before upsert.
+        final ongoingMatches = await _supabase
+            .from('matches')
+            .select()
+            .eq('status', 'ongoing') as List<dynamic>;
+
+        final completedMatches = await _supabase
+            .from('matches')
+            .select()
+            .eq('status', 'completed')
+            .order('created_at', ascending: false)
+            .limit(50) as List<dynamic>;
+
+        // Merge & de-duplicate by UUID
+        final seenUuids = <String>{};
+        final remoteMatches = <dynamic>[];
+        for (final m in [...ongoingMatches, ...completedMatches]) {
+          final uuid = (m as Map<String, dynamic>)['id'] as String? ?? '';
+          if (seenUuids.add(uuid)) remoteMatches.add(m);
+        }
+
+        await db.transaction((txn) async {
+          for (final m in remoteMatches) {
             final row = m as Map<String, dynamic>;
-            final inserted = await txn.insert(
+            final matchUuid = row['id'] as String? ?? '';
+
+            final localId = await txn.insert(
               DatabaseHelper.tableMatches,
               {
-                DatabaseHelper.colUuid:           row['id']             as String? ?? '',
+                DatabaseHelper.colUuid:           matchUuid,
                 DatabaseHelper.colTeamA:          row['team_a']         as String? ?? '',
                 DatabaseHelper.colTeamB:          row['team_b']         as String? ?? '',
                 DatabaseHelper.colTotalOvers:     row['overs']          as int?    ?? 10,
-                DatabaseHelper.colTossWinner:     row['toss_winner']    as String? ?? '',
-                DatabaseHelper.colOptTo:          row['toss_decision']  as String? ?? '',
+                DatabaseHelper.colTossWinner:     row['toss_winner']    as String?,
+                DatabaseHelper.colOptTo:          row['toss_decision']  as String?,
                 DatabaseHelper.colStatus:         row['status']         as String? ?? 'completed',
-                DatabaseHelper.colTournamentName: row['tournament_name'] as String?,
+                DatabaseHelper.colTournamentId:   tournamentUuidToLocalId[row['tournament_id'] as String? ?? ''],
                 DatabaseHelper.colWinner:         row['winner']         as String?,
                 DatabaseHelper.colCreatedBy:      row['created_by']     as String? ?? userId,
                 DatabaseHelper.colSyncStatus:     1,
+                // NOT NULL — must always be supplied.
+                DatabaseHelper.colCreatedAt:
+                    row['created_at'] as String? ??
+                    DateTime.now().toIso8601String(),
               },
-              conflictAlgorithm: ConflictAlgorithm.ignore,
+              conflictAlgorithm: ConflictAlgorithm.replace,
             );
-            if (inserted > 0) matchesInserted++;
+            if (localId > 0) {
+              matchesInserted++;
+              if (matchUuid.isNotEmpty) matchUuidToLocalId[matchUuid] = localId;
+            }
           }
         });
+
+        // After REPLACE the auto-incremented ids may differ from any previous
+        // run.  Rebuild the uuid→id map from the live DB to be safe.
+        final freshRows = await db.query(
+          DatabaseHelper.tableMatches,
+          columns: [DatabaseHelper.colId, DatabaseHelper.colUuid],
+        );
+        for (final r in freshRows) {
+          final u = r[DatabaseHelper.colUuid] as String? ?? '';
+          if (u.isNotEmpty) {
+            matchUuidToLocalId[u] = r[DatabaseHelper.colId] as int;
+          }
+        }
+
         developer.log(
-          'syncDownInitialData: inserted $matchesInserted/${(remoteMatches as List).length} match(es)',
+          'syncDownInitialData: upserted $matchesInserted/${remoteMatches.length} match(es)',
           name: 'SyncService',
         );
       } catch (e, st) {
@@ -998,12 +1667,248 @@ class SyncService extends ChangeNotifier {
           stackTrace: st,
           level: 900,
         );
+        // Bail — ball_events need matches to exist first.
+        _setState(SyncState.error);
+        return;
+      }
+
+      // ══════════════════════════════════════════════════════════════════════
+      // 5. BALL EVENTS
+      // ══════════════════════════════════════════════════════════════════════
+      //
+      // Build a player uuid→localId cache once, reuse across all matches.
+      int ballEventsInserted = 0;
+      try {
+        final playerRows = await db.query(
+          DatabaseHelper.tablePlayers,
+          columns: [DatabaseHelper.colId, DatabaseHelper.colUuid],
+        );
+        final Map<String, int> playerUuidToLocalId = {
+          for (final r in playerRows)
+            if ((r[DatabaseHelper.colUuid] as String? ?? '').isNotEmpty)
+              r[DatabaseHelper.colUuid] as String: r[DatabaseHelper.colId] as int,
+        };
+
+        int? resolvePlayer(dynamic uuidVal) {
+          if (uuidVal == null) return null;
+          final s = uuidVal as String;
+          return s.isEmpty ? null : playerUuidToLocalId[s];
+        }
+
+        final remoteBalls =
+            await _supabase.from('ball_events').select() as List<dynamic>;
+
+        await db.transaction((txn) async {
+          // ── Delete existing synced ball_events before reinserting ────────
+          // Without this, every call appends duplicates because ball_events
+          // has no UNIQUE constraint — only an auto-increment PK.  This
+          // mirrors the delete-then-insert pattern in syncDownBallEvents().
+          // Only sync_status = 1 rows are removed; locally-created unsynced
+          // balls (sync_status = 0) are preserved so in-flight deliveries
+          // are never lost.
+          for (final localMatchId in matchUuidToLocalId.values) {
+            await txn.delete(
+              DatabaseHelper.tableBallEvents,
+              where:
+                  '${DatabaseHelper.colMatchId} = ? AND ${DatabaseHelper.colSyncStatus} = 1',
+              whereArgs: [localMatchId],
+            );
+          }
+
+          for (final raw in remoteBalls) {
+            final r   = raw as Map<String, dynamic>;
+            final muuid = r['match_id'] as String? ?? '';
+            final localMatchId = matchUuidToLocalId[muuid];
+            if (localMatchId == null) continue; // match not synced — skip
+
+            final n = await txn.insert(
+              DatabaseHelper.tableBallEvents,
+              {
+                DatabaseHelper.colMatchId:      localMatchId,
+                DatabaseHelper.colInnings:      r['innings']        as int?    ?? 1,
+                DatabaseHelper.colOverNum:      r['over_number']    as int?    ?? 0,
+                DatabaseHelper.colBallNum:      r['ball_number']    as int?    ?? 0,
+                DatabaseHelper.colRunsScored:   r['runs_scored']    as int?    ?? 0,
+                DatabaseHelper.colIsBoundary:   (r['is_boundary']   as bool?   ?? false) ? 1 : 0,
+                DatabaseHelper.colIsWicket:     (r['is_wicket']     as bool?   ?? false) ? 1 : 0,
+                DatabaseHelper.colWicketType:   r['dismissal_type'] as String?,
+                DatabaseHelper.colExtraType:    r['extra_type']     as String?,
+                DatabaseHelper.colExtraRuns:    r['extra_runs']     as int?    ?? 0,
+                DatabaseHelper.colStrikerId:    resolvePlayer(r['striker']),
+                DatabaseHelper.colNonStrikerId: resolvePlayer(r['non_striker']),
+                DatabaseHelper.colBowlerId:     resolvePlayer(r['bowler']),
+                DatabaseHelper.colOutPlayerId:  resolvePlayer(r['player_out']),
+                DatabaseHelper.colSyncStatus:   1,
+                DatabaseHelper.colCreatedAt:    r['created_at'] as String?
+                    ?? DateTime.now().toIso8601String(),
+                DatabaseHelper.colCreatedBy:    r['created_by'] as String?,
+              },
+              conflictAlgorithm: ConflictAlgorithm.replace,
+            );
+            if (n > 0) ballEventsInserted++;
+          }
+        });
+        developer.log(
+          'syncDownInitialData: upserted $ballEventsInserted/${remoteBalls.length} ball_event(s)',
+          name: 'SyncService',
+        );
+      } catch (e, st) {
+        developer.log(
+          'syncDownInitialData: failed to pull ball_events',
+          name: 'SyncService',
+          error: e,
+          stackTrace: st,
+          level: 900,
+        );
+        // Non-fatal — players + matches already landed successfully.
       }
 
       developer.log('syncDownInitialData: pull complete', name: 'SyncService');
+      _setState(SyncState.synced);
     } catch (e, st) {
       developer.log(
         'syncDownInitialData: unexpected failure',
+        name: 'SyncService',
+        error: e,
+        stackTrace: st,
+        level: 1000,
+      );
+      _setState(SyncState.error);
+    } finally {
+      _isSyncingDown = false;
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // DOWNWARD SYNC — ball_events for a specific match
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /// Pull all `ball_events` rows for [matchUuid] from Supabase and replace
+  /// the local copy in SQLite.
+  ///
+  /// Player UUID references in Supabase (`striker`, `non_striker`, `bowler`,
+  /// `player_out`) are resolved to local integer IDs via the `players.uuid`
+  /// column.  If a player UUID cannot be resolved (e.g. the player row has not
+  /// yet been synced down) the FK is stored as NULL rather than failing.
+  ///
+  /// The local `matches.uuid` is used to look up the local integer `match_id`.
+  ///
+  /// Only rows with `sync_status = 1` (already pushed to Supabase) are deleted
+  /// before the fresh batch is inserted.  Locally-created unsynced rows
+  /// (`sync_status = 0`) are preserved so in-flight balls are never lost.
+  Future<void> syncDownBallEvents(String matchUuid) async {
+    try {
+      // Require connectivity.
+      final isOnline = await _checkConnectivity();
+      if (!isOnline) {
+        developer.log(
+          'syncDownBallEvents: offline — skipping',
+          name: 'SyncService',
+        );
+        return;
+      }
+
+      final db = await _db.database;
+
+      // ── Resolve local integer match id ───────────────────────────────────
+      final matchRows = await db.query(
+        DatabaseHelper.tableMatches,
+        columns: [DatabaseHelper.colId],
+        where: '${DatabaseHelper.colUuid} = ?',
+        whereArgs: [matchUuid],
+        limit: 1,
+      );
+      if (matchRows.isEmpty) {
+        developer.log(
+          'syncDownBallEvents: local match not found for uuid=$matchUuid',
+          name: 'SyncService',
+          level: 800,
+        );
+        return;
+      }
+      final localMatchId = matchRows.first[DatabaseHelper.colId] as int;
+
+      // ── Build a UUID → local_int_id cache for players ────────────────────
+      final playerRows = await db.query(
+        DatabaseHelper.tablePlayers,
+        columns: [DatabaseHelper.colId, DatabaseHelper.colUuid],
+      );
+      final Map<String, int> uuidToLocalId = {
+        for (final r in playerRows)
+          if ((r[DatabaseHelper.colUuid] as String).isNotEmpty)
+            r[DatabaseHelper.colUuid] as String: r[DatabaseHelper.colId] as int,
+      };
+
+      int? resolvePlayer(dynamic uuidVal) {
+        if (uuidVal == null) return null;
+        return uuidToLocalId[uuidVal as String];
+      }
+
+      // ── Fetch from Supabase ───────────────────────────────────────────────
+      final remoteBalls = await _supabase
+          .from('ball_events')
+          .select()
+          .eq('match_id', matchUuid);
+
+      if ((remoteBalls as List).isEmpty) {
+        developer.log(
+          'syncDownBallEvents: no remote ball_events for match $matchUuid',
+          name: 'SyncService',
+        );
+        return;
+      }
+
+      // ── Replace local synced rows with fresh batch from Supabase ─────────
+      // Delete only rows that originated from Supabase (sync_status = 1).
+      // Locally-created unsynced balls (sync_status = 0) are preserved so
+      // the scorer never loses in-flight deliveries.
+      int inserted = 0;
+      await db.transaction((txn) async {
+        await txn.delete(
+          DatabaseHelper.tableBallEvents,
+          where:
+              '${DatabaseHelper.colMatchId} = ? AND ${DatabaseHelper.colSyncStatus} = 1',
+          whereArgs: [localMatchId],
+        );
+
+        for (final raw in remoteBalls) {
+          final r = raw as Map<String, dynamic>;
+
+          final n = await txn.insert(
+            DatabaseHelper.tableBallEvents,
+            {
+              DatabaseHelper.colMatchId:      localMatchId,
+              DatabaseHelper.colInnings:      r['innings']        as int? ?? 1,
+              DatabaseHelper.colOverNum:      r['over_number']    as int? ?? 0,
+              DatabaseHelper.colBallNum:      r['ball_number']    as int? ?? 0,
+              DatabaseHelper.colRunsScored:   r['runs_scored']    as int? ?? 0,
+              DatabaseHelper.colIsBoundary:   (r['is_boundary']   as bool? ?? false) ? 1 : 0,
+              DatabaseHelper.colIsWicket:     (r['is_wicket']     as bool? ?? false) ? 1 : 0,
+              DatabaseHelper.colWicketType:   r['dismissal_type'] as String?,
+              DatabaseHelper.colExtraType:    r['extra_type']     as String?,
+              DatabaseHelper.colExtraRuns:    r['extra_runs']     as int? ?? 0,
+              DatabaseHelper.colStrikerId:    resolvePlayer(r['striker']),
+              DatabaseHelper.colNonStrikerId: resolvePlayer(r['non_striker']),
+              DatabaseHelper.colBowlerId:     resolvePlayer(r['bowler']),
+              DatabaseHelper.colOutPlayerId:  resolvePlayer(r['player_out']),
+              DatabaseHelper.colSyncStatus:   1, // already in Supabase
+              DatabaseHelper.colCreatedAt:    r['created_at'] as String?
+                  ?? DateTime.now().toIso8601String(),
+              DatabaseHelper.colCreatedBy:    r['created_by'] as String?,
+            },
+            conflictAlgorithm: ConflictAlgorithm.replace,
+          );
+          if (n > 0) inserted++;
+        }
+      });
+
+      developer.log(
+        'syncDownBallEvents: replaced with $inserted/${remoteBalls.length} ball_event(s) for match $matchUuid',
+        name: 'SyncService',
+      );
+    } catch (e, st) {
+      developer.log(
+        'syncDownBallEvents: unexpected failure for match $matchUuid',
         name: 'SyncService',
         error: e,
         stackTrace: st,

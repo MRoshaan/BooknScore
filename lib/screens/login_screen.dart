@@ -36,19 +36,24 @@ class _LoginScreenState extends State<LoginScreen> with SingleTickerProviderStat
   bool _isSignUp = false;
   bool _obscurePassword = true;
   bool _obscureConfirmPassword = true;
+  bool _submitPressed = false;
 
   late AnimationController _animController;
   late Animation<double> _fadeAnim;
+  late Animation<Offset> _slideAnim;
 
   @override
   void initState() {
     super.initState();
     _animController = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 300),
+      duration: const Duration(milliseconds: 480),
     );
     _fadeAnim = Tween<double>(begin: 0.0, end: 1.0).animate(
-      CurvedAnimation(parent: _animController, curve: Curves.easeInOut),
+      CurvedAnimation(parent: _animController, curve: const Interval(0.0, 0.7, curve: Curves.easeOut)),
+    );
+    _slideAnim = Tween<Offset>(begin: const Offset(0, 0.18), end: Offset.zero).animate(
+      CurvedAnimation(parent: _animController, curve: const Interval(0.0, 0.85, curve: Curves.easeOutCubic)),
     );
     _animController.forward();
   }
@@ -160,30 +165,46 @@ class _LoginScreenState extends State<LoginScreen> with SingleTickerProviderStat
 
   @override
   Widget build(BuildContext context) {
+    final screenWidth = MediaQuery.of(context).size.width;
+    // Card occupies 88 % of screen width, capped at 480 for tablets.
+    final cardWidth = (screenWidth * 0.88).clamp(0.0, 480.0);
+
     return Scaffold(
       backgroundColor: _surfaceDark,
       body: SafeArea(
         child: SingleChildScrollView(
-          padding: const EdgeInsets.symmetric(horizontal: 24),
-          child: FadeTransition(
-            opacity: _fadeAnim,
-            child: Column(
-              children: [
-                const SizedBox(height: 60),
-                
-                // ── Logo Section ─────────────────────────────────────────────
-                _buildLogo(),
-                const SizedBox(height: 48),
-                
-                // ── Form Card ────────────────────────────────────────────────
-                _buildFormCard(),
-                const SizedBox(height: 24),
-                
-                // ── Toggle Mode ──────────────────────────────────────────────
-                _buildToggleMode(),
-                const SizedBox(height: 40),
-              ],
-            ),
+          padding: EdgeInsets.symmetric(horizontal: (screenWidth - cardWidth) / 2),
+          child: Column(
+            children: [
+              const SizedBox(height: 52),
+
+              // ── Logo Section (fades in with the rest) ────────────────
+              FadeTransition(
+                opacity: _fadeAnim,
+                child: _buildLogo(),
+              ),
+              const SizedBox(height: 40),
+
+              // ── Form Card (slides up + fades in) ────────────────────
+              FadeTransition(
+                opacity: _fadeAnim,
+                child: SlideTransition(
+                  position: _slideAnim,
+                  child: SizedBox(
+                    width: cardWidth,
+                    child: _buildFormCard(),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 20),
+
+              // ── Toggle Mode ──────────────────────────────────────────
+              FadeTransition(
+                opacity: _fadeAnim,
+                child: _buildToggleMode(),
+              ),
+              const SizedBox(height: 40),
+            ],
           ),
         ),
       ),
@@ -193,33 +214,55 @@ class _LoginScreenState extends State<LoginScreen> with SingleTickerProviderStat
   Widget _buildLogo() {
     return Column(
       children: [
-        // App icon
-        Container(
-          width: 90,
-          height: 90,
-          decoration: BoxDecoration(
-            gradient: LinearGradient(
-              begin: Alignment.topLeft,
-              end: Alignment.bottomRight,
-              colors: [_primaryGreen, _accentGreen],
-            ),
-            borderRadius: BorderRadius.circular(24),
-            boxShadow: [
-              BoxShadow(
-                color: _accentGreen.withAlpha(80),
-                blurRadius: 24,
-                offset: const Offset(0, 8),
+        // Radial glow + icon
+        Stack(
+          alignment: Alignment.center,
+          children: [
+            // Subtle dark-green radial gradient behind logo
+            Container(
+              width: 160,
+              height: 160,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                gradient: RadialGradient(
+                  colors: [
+                    const Color(0xFF39FF14).withAlpha(35),
+                    const Color(0xFF1B5E20).withAlpha(15),
+                    Colors.transparent,
+                  ],
+                  stops: const [0.0, 0.5, 1.0],
+                ),
               ),
-            ],
-          ),
-          child: const Icon(
-            Icons.sports_cricket,
-            size: 45,
-            color: Colors.white,
-          ),
+            ),
+            // App icon
+            Container(
+              width: 90,
+              height: 90,
+              decoration: BoxDecoration(
+                gradient: const LinearGradient(
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                  colors: [_primaryGreen, _accentGreen],
+                ),
+                borderRadius: BorderRadius.circular(24),
+                boxShadow: [
+                  BoxShadow(
+                    color: _accentGreen.withAlpha(80),
+                    blurRadius: 24,
+                    offset: const Offset(0, 8),
+                  ),
+                ],
+              ),
+              child: const Icon(
+                Icons.sports_cricket,
+                size: 45,
+                color: Colors.white,
+              ),
+            ),
+          ],
         ),
-        const SizedBox(height: 20),
-        
+        const SizedBox(height: 18),
+
         // App name
         Text(
           'WICKET.PK',
@@ -230,14 +273,15 @@ class _LoginScreenState extends State<LoginScreen> with SingleTickerProviderStat
             letterSpacing: 5,
           ),
         ),
-        const SizedBox(height: 6),
+        const SizedBox(height: 5),
+        // Tagline
         Text(
-          'Professional Cricket Scoring',
+          'Score Every Ball.',
           style: GoogleFonts.rajdhani(
             fontSize: 14,
             fontWeight: FontWeight.w600,
-            color: _textSecondary,
-            letterSpacing: 1,
+            color: _accentGreen,
+            letterSpacing: 1.5,
           ),
         ),
       ],
@@ -426,45 +470,46 @@ class _LoginScreenState extends State<LoginScreen> with SingleTickerProviderStat
                     ],
                     const SizedBox(height: 24),
                     
-                     // Submit button
-                    SizedBox(
-                      height: 54,
-                      child: ElevatedButton(
-                        onPressed: auth.isLoading ? null : _submit,
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: _accentGreen,
-                          disabledBackgroundColor: _accentGreen.withAlpha(100),
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(14),
-                          ),
-                        ),
-                        child: auth.isLoading
-                            ? const SizedBox(
-                                width: 24,
-                                height: 24,
-                                child: CircularProgressIndicator(
-                                  strokeWidth: 2.5,
-                                  color: Colors.white,
-                                ),
-                              )
-                            : Row(
-                                mainAxisAlignment: MainAxisAlignment.center,
-                                children: [
-                                  Icon(
-                                    _isSignUp ? Icons.person_add : Icons.login,
-                                    size: 22,
-                                  ),
-                                  const SizedBox(width: 10),
-                                  Text(
-                                    _isSignUp ? 'Create Account' : 'Sign In',
+                     // Submit button with press-scale effect
+                    GestureDetector(
+                      onTapDown: (_) => setState(() => _submitPressed = true),
+                      onTapUp: (_) => setState(() => _submitPressed = false),
+                      onTapCancel: () => setState(() => _submitPressed = false),
+                      child: AnimatedScale(
+                        scale: _submitPressed ? 0.97 : 1.0,
+                        duration: const Duration(milliseconds: 90),
+                        child: SizedBox(
+                          height: 54,
+                          width: double.infinity,
+                          child: ElevatedButton(
+                            onPressed: auth.isLoading ? null : _submit,
+                            style: ElevatedButton.styleFrom(
+                              backgroundColor: _accentGreen,
+                              disabledBackgroundColor: _accentGreen.withAlpha(100),
+                              shape: RoundedRectangleBorder(
+                                borderRadius: BorderRadius.circular(14),
+                              ),
+                            ),
+                            child: auth.isLoading
+                                ? const SizedBox(
+                                    width: 24,
+                                    height: 24,
+                                    child: CircularProgressIndicator(
+                                      strokeWidth: 2.5,
+                                      color: Colors.white,
+                                    ),
+                                  )
+                                : Text(
+                                    _isSignUp ? 'CREATE ACCOUNT' : 'SIGN IN',
                                     style: GoogleFonts.rajdhani(
                                       fontSize: 18,
-                                      fontWeight: FontWeight.w800,
-                                      letterSpacing: 1,
+                                      fontWeight: FontWeight.w900,
+                                      letterSpacing: 2,
+                                      color: Colors.white,
                                     ),
                                   ),
-                                ],
-                              ),
+                          ),
+                        ),
                       ),
                     ),
 
@@ -477,11 +522,12 @@ class _LoginScreenState extends State<LoginScreen> with SingleTickerProviderStat
                           Padding(
                             padding: const EdgeInsets.symmetric(horizontal: 12),
                             child: Text(
-                              'OR',
+                              '── OR ──',
                               style: GoogleFonts.rajdhani(
                                 color: _hintColor,
                                 fontWeight: FontWeight.w600,
                                 fontSize: 13,
+                                letterSpacing: 2,
                               ),
                             ),
                           ),

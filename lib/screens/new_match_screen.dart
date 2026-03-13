@@ -2,11 +2,9 @@ import 'dart:ui';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
-import 'package:provider/provider.dart';
 
 import '../services/database_helper.dart';
 import '../services/auth_service.dart';
-import '../providers/match_provider.dart';
 import 'scoring_screen.dart';
 
 // ── Brand Palette ────────────────────────────────────────────────────────────
@@ -22,15 +20,19 @@ const Color _textPrimary   = Colors.white;
 
 class NewMatchScreen extends StatefulWidget {
   /// If [tournamentId] is provided the match is linked to that tournament.
-  /// [tournamentName] is used to pre-fill and lock the tournament name field.
+  ///
+  /// [tournamentFormat] should be one of `'league'`, `'knockout'`, or
+  /// `'mixed'`.  When it is `'knockout'` the match-stage dropdown is hidden
+  /// and the stage is computed automatically from the number of active
+  /// (non-eliminated) teams remaining in the tournament.
   const NewMatchScreen({
     super.key,
     this.tournamentId,
-    this.tournamentName,
+    this.tournamentFormat,
   });
 
   final int?    tournamentId;
-  final String? tournamentName;
+  final String? tournamentFormat;
 
   @override
   State<NewMatchScreen> createState() => _NewMatchScreenState();
@@ -41,7 +43,6 @@ class _NewMatchScreenState extends State<NewMatchScreen> {
   final _teamACtrl = TextEditingController();
   final _teamBCtrl = TextEditingController();
   final _oversCtrl = TextEditingController(text: '20');
-  final _tournamentCtrl = TextEditingController();
 
   String? _tossWinner;  // 'team_a' or 'team_b'
   String? _optTo;       // 'bat' or 'bowl'
@@ -77,10 +78,6 @@ class _NewMatchScreenState extends State<NewMatchScreen> {
   @override
   void initState() {
     super.initState();
-    // Pre-fill tournament name when launched from a tournament dashboard
-    if (widget.tournamentName != null) {
-      _tournamentCtrl.text = widget.tournamentName!;
-    }
     // Load registered teams if we are in tournament mode
     if (widget.tournamentId != null) {
       _loadTournamentTeams();
@@ -92,8 +89,21 @@ class _NewMatchScreenState extends State<NewMatchScreen> {
     _teamACtrl.dispose();
     _teamBCtrl.dispose();
     _oversCtrl.dispose();
-    _tournamentCtrl.dispose();
     super.dispose();
+  }
+
+  // ── Helpers ─────────────────────────────────────────────────────────────────
+
+  bool get _isKnockout =>
+      widget.tournamentFormat?.toLowerCase() == 'knockout';
+
+  /// Derive the stage label from the number of active teams still in the
+  /// knockout tournament.
+  static String _stageForTeamCount(int activeCount) {
+    if (activeCount <= 2) return 'Final';
+    if (activeCount <= 4) return 'Semi-Final';
+    if (activeCount <= 8) return 'Quarter-Final';
+    return 'Group Stage';
   }
 
   // ── Load tournament teams ──────────────────────────────────────────────────
@@ -104,7 +114,15 @@ class _NewMatchScreenState extends State<NewMatchScreen> {
     try {
       final db = DatabaseHelper.instance;
       final teams = await db.fetchActiveTeams(widget.tournamentId!);
-      if (mounted) setState(() => _tournamentTeams = teams);
+      if (mounted) {
+        setState(() {
+          _tournamentTeams = teams;
+          // Auto-set stage for knockout tournaments based on remaining teams
+          if (_isKnockout) {
+            _matchStage = _stageForTeamCount(teams.length);
+          }
+        });
+      }
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -174,27 +192,40 @@ class _NewMatchScreenState extends State<NewMatchScreen> {
         tossWinnerName = _effectiveTeamB;
       }
 
+      // For quick matches, ensure both team names exist in the teams table
+      // (find-or-create) so we can store proper FK references on the match row.
+      int? teamAId;
+      int? teamBId;
+      if (widget.tournamentId == null) {
+        teamAId = await db.ensureTeamExists(
+          _effectiveTeamA,
+          createdBy: userId,
+        );
+        teamBId = await db.ensureTeamExists(
+          _effectiveTeamB,
+          createdBy: userId,
+        );
+      }
+
       // Create match - NO players pre-selected, enter as you go
       final matchId = await db.insertMatch(
-        teamA:          _effectiveTeamA,
-        teamB:          _effectiveTeamB,
-        totalOvers:     int.parse(_oversCtrl.text.trim()),
-        tossWinner:     tossWinnerName,
-        optTo:          _optTo,
-        createdBy:      userId,
-        tournamentName: _tournamentCtrl.text.trim().isEmpty ? null : _tournamentCtrl.text.trim(),
-        tournamentId:   widget.tournamentId,
-        matchStage:     widget.tournamentId != null ? _matchStage : null,
+        teamA:        _effectiveTeamA,
+        teamB:        _effectiveTeamB,
+        totalOvers:   int.parse(_oversCtrl.text.trim()),
+        tossWinner:   tossWinnerName,
+        optTo:        _optTo,
+        createdBy:    userId,
+        tournamentId: widget.tournamentId,
+        matchStage:   widget.tournamentId != null ? _matchStage : null,
+        teamAId:      teamAId,
+        teamBId:      teamBId,
       );
 
       if (!mounted) return;
 
-      // Load match into provider - it will prompt for opening players
-      await context.read<MatchProvider>().loadMatch(matchId);
-
-      if (!mounted) return;
-      
-      // Navigate to scoring screen - initial players dialog will show there
+      // Navigate to scoring screen — ScoringScreen.initState() calls loadMatch()
+      // exclusively.  Do NOT call loadMatch() here first; doing so causes a
+      // double-load race condition that doubles the score on resume.
       Navigator.of(context).pushReplacement(
         MaterialPageRoute(
           builder: (_) => ScoringScreen(matchId: matchId),
@@ -251,59 +282,39 @@ class _NewMatchScreenState extends State<NewMatchScreen> {
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
                       // ── Optional: Tournament Name ─────────────────────────────
-                      _buildSectionHeader(
-                        widget.tournamentId != null
-                            ? 'TOURNAMENT'
-                            : 'TOURNAMENT (OPTIONAL)',
-                      ),
-                      const SizedBox(height: 12),
-                      
-                      TextFormField(
-                        controller:   _tournamentCtrl,
-                        readOnly:     widget.tournamentId != null,
-                        textCapitalization: TextCapitalization.words,
-                        style: GoogleFonts.rajdhani(
-                          color: widget.tournamentId != null ? _hintColor : _textPrimary,
-                          fontSize: 16,
-                          fontWeight: FontWeight.w600,
-                        ),
-                        decoration: _inputDecoration(
-                          'Tournament Name',
-                          hint: 'e.g. Gully Premier League',
-                          icon: Icons.emoji_events,
-                        ),
-                      ),
-
                       // ── Match Stage (only for tournament matches) ─────────
                       if (widget.tournamentId != null) ...[
-                        const SizedBox(height: 16),
                         _buildSectionHeader('MATCH STAGE'),
                         const SizedBox(height: 12),
-                        DropdownButtonFormField<String>(
-                          initialValue: _matchStage,
-                          dropdownColor: _surfaceCard,
-                          style: GoogleFonts.rajdhani(
-                            color: _textPrimary,
-                            fontSize: 16,
-                            fontWeight: FontWeight.w600,
-                          ),
-                          decoration: _inputDecoration(
-                            'Stage',
-                            icon: Icons.outlined_flag,
-                          ),
-                          hint: Text(
-                            'Select stage',
+                        if (_isKnockout)
+                          // Knockout: auto-computed stage badge (read-only)
+                          _buildKnockoutStageBadge()
+                        else
+                          DropdownButtonFormField<String>(
+                            initialValue: _matchStage,
+                            dropdownColor: _surfaceCard,
                             style: GoogleFonts.rajdhani(
-                              color: _hintColor,
+                              color: _textPrimary,
                               fontSize: 16,
+                              fontWeight: FontWeight.w600,
                             ),
+                            decoration: _inputDecoration(
+                              'Stage',
+                              icon: Icons.outlined_flag,
+                            ),
+                            hint: Text(
+                              'Select stage',
+                              style: GoogleFonts.rajdhani(
+                                color: _hintColor,
+                                fontSize: 16,
+                              ),
+                            ),
+                            items: _stageOptions.map((s) => DropdownMenuItem(
+                              value: s,
+                              child: Text(s),
+                            )).toList(),
+                            onChanged: (v) => setState(() => _matchStage = v),
                           ),
-                          items: _stageOptions.map((s) => DropdownMenuItem(
-                            value: s,
-                            child: Text(s),
-                          )).toList(),
-                          onChanged: (v) => setState(() => _matchStage = v),
-                        ),
                       ],
 
                       const SizedBox(height: 24),
@@ -482,6 +493,43 @@ class _NewMatchScreenState extends State<NewMatchScreen> {
     );
   }
 
+  /// Read-only stage badge shown for knockout tournaments.
+  Widget _buildKnockoutStageBadge() {
+    final stage = _matchStage ?? (_teamsLoading ? '...' : '—');
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+      decoration: BoxDecoration(
+        color: _inputFill,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: _accentGreen.withAlpha(120), width: 1.5),
+      ),
+      child: Row(
+        children: [
+          const Icon(Icons.outlined_flag, color: _accentGreen, size: 20),
+          const SizedBox(width: 12),
+          Text(
+            stage,
+            style: GoogleFonts.rajdhani(
+              color: _accentGreen,
+              fontSize: 16,
+              fontWeight: FontWeight.w700,
+            ),
+          ),
+          const Spacer(),
+          Text(
+            'AUTO',
+            style: GoogleFonts.rajdhani(
+              color: _hintColor,
+              fontSize: 11,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 2,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   // ── Team Input Builder ─────────────────────────────────────────────────────
   /// Builds either a [DropdownButtonFormField] (tournament mode) or a
   /// [TextFormField] (quick-match mode) for the given [slot] ('A' or 'B').
@@ -574,29 +622,121 @@ class _NewMatchScreenState extends State<NewMatchScreen> {
       );
     }
 
-    // ── Quick-match mode → TextField ───────────────────────────────────────
+    // ── Quick-match mode → Autocomplete TextField ──────────────────────────
     final ctrl = isA ? _teamACtrl : _teamBCtrl;
 
-    return TextFormField(
-      controller: ctrl,
-      textCapitalization: TextCapitalization.words,
-      style: GoogleFonts.rajdhani(
-        color: _textPrimary,
-        fontSize: 16,
-        fontWeight: FontWeight.w600,
-      ),
-      decoration: _inputDecoration(label, hint: hint, icon: icon),
-      validator: (v) {
-        if (v == null || v.trim().isEmpty) return 'Required';
-        if (v.trim().length < 2) return 'Min 2 characters';
-        if (!isA) {
-          final a = _teamACtrl.text.trim().toLowerCase();
-          final b = v.trim().toLowerCase();
-          if (a.isNotEmpty && a == b) return 'Must be different';
-        }
-        return null;
+    return Autocomplete<String>(
+      initialValue: TextEditingValue(text: ctrl.text),
+      optionsBuilder: (TextEditingValue textEditingValue) async {
+        // Always fetch so the list updates as the user types
+        final suggestions = await DatabaseHelper.instance.getDistinctTeamNames(
+          prefix: textEditingValue.text,
+          limit: 5,
+        );
+        // Filter out exact match to avoid a suggestion that duplicates the field
+        return suggestions.where((s) =>
+            s.toLowerCase() != textEditingValue.text.trim().toLowerCase());
       },
-      onChanged: (_) => setState(() {}), // Rebuild for toss & preview
+      displayStringForOption: (s) => s,
+      optionsViewBuilder: (context, onSelected, options) {
+        return Align(
+          alignment: Alignment.topLeft,
+          child: Material(
+            color: Colors.transparent,
+            child: Container(
+              constraints: const BoxConstraints(maxHeight: 200),
+              margin: const EdgeInsets.only(top: 4),
+              decoration: BoxDecoration(
+                color: _surfaceCard,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: const Color(0xFF2A2A2A)),
+                boxShadow: [
+                  BoxShadow(
+                    color: Colors.black.withAlpha(120),
+                    blurRadius: 12,
+                    offset: const Offset(0, 4),
+                  ),
+                ],
+              ),
+              child: ListView.separated(
+                padding: EdgeInsets.zero,
+                shrinkWrap: true,
+                itemCount: options.length,
+                separatorBuilder: (context, index) =>
+                    const Divider(height: 1, color: Color(0xFF2A2A2A)),
+                itemBuilder: (context, index) {
+                  final option = options.elementAt(index);
+                  return InkWell(
+                    onTap: () => onSelected(option),
+                    borderRadius: index == 0
+                        ? const BorderRadius.vertical(top: Radius.circular(12))
+                        : (index == options.length - 1
+                            ? const BorderRadius.vertical(
+                                bottom: Radius.circular(12))
+                            : BorderRadius.zero),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 16, vertical: 12),
+                      child: Row(
+                        children: [
+                          Icon(Icons.history, size: 16, color: _hintColor),
+                          const SizedBox(width: 10),
+                          Text(
+                            option,
+                            style: GoogleFonts.rajdhani(
+                              color: _textPrimary,
+                              fontSize: 15,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  );
+                },
+              ),
+            ),
+          ),
+        );
+      },
+      fieldViewBuilder:
+          (context, textController, focusNode, onFieldSubmitted) {
+        // Keep the external controller in sync with the Autocomplete internal one
+        textController.text = ctrl.text;
+        textController.addListener(() {
+          if (ctrl.text != textController.text) {
+            ctrl.text = textController.text;
+            ctrl.selection = textController.selection;
+            setState(() {}); // Rebuild for toss & preview
+          }
+        });
+        return TextFormField(
+          controller: textController,
+          focusNode: focusNode,
+          textCapitalization: TextCapitalization.words,
+          style: GoogleFonts.rajdhani(
+            color: _textPrimary,
+            fontSize: 16,
+            fontWeight: FontWeight.w600,
+          ),
+          decoration: _inputDecoration(label, hint: hint, icon: icon),
+          validator: (v) {
+            if (v == null || v.trim().isEmpty) return 'Required';
+            if (v.trim().length < 2) return 'Min 2 characters';
+            if (!isA) {
+              final a = _teamACtrl.text.trim().toLowerCase();
+              final b = v.trim().toLowerCase();
+              if (a.isNotEmpty && a == b) return 'Must be different';
+            }
+            return null;
+          },
+          onFieldSubmitted: (_) => onFieldSubmitted(),
+        );
+      },
+      onSelected: (String selection) {
+        ctrl.text = selection;
+        setState(() {}); // Rebuild for toss & preview
+      },
     );
   }
 
@@ -745,7 +885,7 @@ class _NewMatchScreenState extends State<NewMatchScreen> {
     final a = _effectiveTeamA;
     final b = _effectiveTeamB;
     final overs = _oversCtrl.text.trim();
-    final tournament = _tournamentCtrl.text.trim();
+    final isTournamentMatch = widget.tournamentId != null;
 
     final teamA = a.isEmpty ? 'Team A' : a;
     final teamB = b.isEmpty ? 'Team B' : b;
@@ -779,10 +919,10 @@ class _NewMatchScreenState extends State<NewMatchScreen> {
           ),
           child: Column(
             children: [
-              // Tournament name if present
-              if (tournament.isNotEmpty) ...[
+              // Show "TOURNAMENT MATCH" badge or generic "MATCH PREVIEW" label
+              if (isTournamentMatch) ...[
                 Text(
-                  tournament.toUpperCase(),
+                  'TOURNAMENT MATCH',
                   style: GoogleFonts.rajdhani(
                     fontSize: 11,
                     fontWeight: FontWeight.w700,

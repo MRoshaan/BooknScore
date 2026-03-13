@@ -61,10 +61,12 @@ class AuthService extends ChangeNotifier {
     if (event == AuthChangeEvent.signedIn) {
       _currentUser = session?.user;
       _error = null;
-      // Kick off a downward sync so the local roster is populated
-      // on first login or after re-install. Runs in microtask to
-      // avoid blocking the auth state notification.
-      Future.microtask(() => SyncService.instance.syncDownInitialData());
+      // Kick off a full downward sync on every sign-in (including re-installs).
+      // force:true bypasses the "skip if players exist" guard so community
+      // matches are always downloaded regardless of local DB state.
+      Future.microtask(
+        () => SyncService.instance.syncDownInitialData(force: true),
+      );
     } else if (event == AuthChangeEvent.signedOut) {
       _currentUser = null;
     } else if (event == AuthChangeEvent.tokenRefreshed) {

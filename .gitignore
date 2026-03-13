@@ -44,3 +44,10 @@ app.*.map.json
 /android/app/profile
 /android/app/release
 nul
+
+# Secret Environment Variables
+.env
+
+# Android Keystore and Passwords (for Play Store)
+*.jks
+key.properties

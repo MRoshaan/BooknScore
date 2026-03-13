@@ -7,8 +7,9 @@ import 'package:provider/provider.dart';
 import '../services/database_helper.dart';
 import '../services/sync_service.dart';
 import '../services/auth_service.dart';
+import '../theme.dart';
+import '../widgets/app_drawer.dart';
 import 'scorecard_screen.dart';
-import '../providers/match_provider.dart';
 import '../providers/tournament_provider.dart';
 import 'new_match_screen.dart';
 import 'scoring_screen.dart';
@@ -17,19 +18,6 @@ import 'players_screen.dart';
 import 'match_summary_screen.dart';
 import 'create_tournament_screen.dart';
 import 'tournament_dashboard_screen.dart';
-
-// ── Brand Palette ─────────────────────────────────────────────────────────────
-const Color _accentGreen    = Color(0xFF39FF14);   // neon-green accent
-const Color _accentGreenMid = Color(0xFF4CAF50);   // softer green for less-prominent elements
-const Color _surfaceDark    = Color(0xFF0A0A0A);
-const Color _surfaceCard    = Color(0xFF141414);
-const Color _surfaceCard2   = Color(0xFF1C1C1C);
-const Color _glassBorder    = Color(0x3239FF14);
-const Color _textPrimary    = Colors.white;
-const Color _textSecondary  = Color(0xFF8A8A8A);
-const Color _liveRed        = Color(0xFFFF3D3D);
-const Color _completedBlue  = Color(0xFF2196F3);
-const Color _trophyGold     = Color(0xFFFFC107);
 
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -71,29 +59,31 @@ class _DashboardScreenState extends State<DashboardScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final c = Theme.of(context).appColors;
     return Scaffold(
-      backgroundColor: _surfaceDark,
+      backgroundColor: c.surface,
+      drawer: const WicketAppDrawer(),
       body: IndexedStack(
         index: _currentTabIndex,
         children: _screens,
       ),
-      bottomNavigationBar: _buildBottomNav(),
-      floatingActionButton: _buildFAB(),
+      bottomNavigationBar: _buildBottomNav(c),
+      floatingActionButton: _buildFAB(c),
       floatingActionButtonLocation: FloatingActionButtonLocation.centerFloat,
     );
   }
 
-  Widget _buildBottomNav() {
+  Widget _buildBottomNav(AppColors c) {
     return Container(
-      decoration: const BoxDecoration(
-        border: Border(top: BorderSide(color: _glassBorder, width: 1)),
+      decoration: BoxDecoration(
+        border: Border(top: BorderSide(color: c.glassBorder, width: 1)),
       ),
       child: BottomNavigationBar(
         currentIndex: _currentTabIndex,
         onTap: _onTabTapped,
-        backgroundColor: _surfaceDark,
-        selectedItemColor: _accentGreen,
-        unselectedItemColor: _textSecondary,
+        backgroundColor: c.surface,
+        selectedItemColor: c.neon,
+        unselectedItemColor: c.textSecondary,
         type: BottomNavigationBarType.fixed,
         elevation: 0,
         selectedLabelStyle: GoogleFonts.rajdhani(fontWeight: FontWeight.w700, fontSize: 11),
@@ -124,7 +114,7 @@ class _DashboardScreenState extends State<DashboardScreen> {
     );
   }
 
-  Widget? _buildFAB() {
+  Widget? _buildFAB(AppColors c) {
     if (_currentTabIndex == 0) {
       // Quick Match FAB
       return Container(
@@ -141,10 +131,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
               if (mounted) _quickKey.currentState?._loadMatches();
             },
             style: ElevatedButton.styleFrom(
-              backgroundColor: _accentGreen,
+              backgroundColor: c.neon,
               foregroundColor: Colors.black,
               elevation: 12,
-              shadowColor: _accentGreen.withAlpha(80),
+              shadowColor: c.neon.withAlpha(80),
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
             ),
             icon: const Icon(Icons.add, size: 22),
@@ -176,10 +166,10 @@ class _DashboardScreenState extends State<DashboardScreen> {
               if (mounted) _tourKey.currentState?._load();
             },
             style: ElevatedButton.styleFrom(
-              backgroundColor: _trophyGold,
+              backgroundColor: c.trophyGold,
               foregroundColor: Colors.black,
               elevation: 12,
-              shadowColor: _trophyGold.withAlpha(80),
+              shadowColor: c.trophyGold.withAlpha(80),
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
             ),
             icon: const Icon(Icons.emoji_events, size: 22),
@@ -213,19 +203,7 @@ class _QuickMatchTabState extends State<_QuickMatchTab> {
   List<Map<String, dynamic>> _matches = [];
   bool _loading = true;
   SyncState _syncStatus = SyncState.idle;
-  final TextEditingController _searchCtrl = TextEditingController();
-  String _searchQuery = '';
   StreamSubscription<SyncState>? _syncSub;
-
-  List<Map<String, dynamic>> get _filtered {
-    if (_searchQuery.isEmpty) return _matches;
-    final q = _searchQuery.toLowerCase();
-    return _matches.where((m) {
-      final a = (m[DatabaseHelper.colTeamA] as String).toLowerCase();
-      final b = (m[DatabaseHelper.colTeamB] as String).toLowerCase();
-      return a.contains(q) || b.contains(q);
-    }).toList();
-  }
 
   @override
   void initState() {
@@ -233,23 +211,47 @@ class _QuickMatchTabState extends State<_QuickMatchTab> {
     _loadMatches();
     _syncStatus = SyncService.instance.state;
     _syncSub = SyncService.instance.syncStatusStream.listen((s) {
-      if (mounted) setState(() => _syncStatus = s);
+      if (!mounted) return;
+      setState(() => _syncStatus = s);
+      // Re-query local DB whenever a sync finishes so new matches appear.
+      if (s == SyncState.idle || s == SyncState.synced) {
+        _reloadMatchesFromDb();
+      }
     });
-    _searchCtrl.addListener(() => setState(() => _searchQuery = _searchCtrl.text));
+  }
+
+  /// Lightweight re-query of local SQLite — no network call, no spinner.
+  Future<void> _reloadMatchesFromDb() async {
+    try {
+      final userId = AuthService.instance.userId;
+      final List<Map<String, dynamic>> all;
+      if (userId != null) {
+        all = await DatabaseHelper.instance.fetchRecentMatches(userId);
+      } else {
+        all = await DatabaseHelper.instance.fetchQuickMatches();
+      }
+      if (mounted) setState(() => _matches = all);
+    } catch (_) {
+      // Non-fatal — silently ignore.
+    }
   }
 
   @override
   void dispose() {
     _syncSub?.cancel();
-    _searchCtrl.dispose();
     super.dispose();
   }
 
   Future<void> _loadMatches() async {
     setState(() => _loading = true);
     try {
-      // Quick matches = no tournament_id
-      final all = await DatabaseHelper.instance.fetchQuickMatches();
+      final userId = AuthService.instance.userId;
+      final List<Map<String, dynamic>> all;
+      if (userId != null) {
+        all = await DatabaseHelper.instance.fetchRecentMatches(userId);
+      } else {
+        all = await DatabaseHelper.instance.fetchQuickMatches();
+      }
       if (mounted) setState(() { _matches = all; _loading = false; });
     } catch (_) {
       if (mounted) setState(() => _loading = false);
@@ -264,8 +266,7 @@ class _QuickMatchTabState extends State<_QuickMatchTab> {
     final creator = match[DatabaseHelper.colCreatedBy] as String?;
     final userId  = AuthService.instance.userId;
 
-    // Completed matches always go to ScorecardScreen (read-only).
-    // Live/pending matches: creator routes to ScoringScreen, others to ScorecardScreen.
+    // Completed matches → direct to Scorecard (read-only), bypassing summary.
     if (status == 'completed') {
       Navigator.push(
         context,
@@ -273,14 +274,26 @@ class _QuickMatchTabState extends State<_QuickMatchTab> {
           builder: (_) => ScorecardScreen(matchId: id, teamA: teamA, teamB: teamB),
         ),
       ).then((_) { if (mounted) _loadMatches(); });
-    } else if (creator != null && creator == userId) {
-      context.read<MatchProvider>().loadMatch(id);
-      Navigator.push(
-        context,
-        MaterialPageRoute(builder: (_) => ScoringScreen(matchId: id)),
-      ).then((_) { if (mounted) _loadMatches(); });
+    } else if (status == 'live' || status == 'ongoing' || status == 'pending') {
+      // Ongoing / live / pending matches:
+      // Creator → resume in ScoringScreen (loadMatch is called exclusively by
+      // ScoringScreen.initState to avoid double-load race conditions).
+      // Non-creator → read-only scorecard.
+      if (creator != null && creator == userId) {
+        Navigator.push(
+          context,
+          MaterialPageRoute(builder: (_) => ScoringScreen(matchId: id)),
+        ).then((_) { if (mounted) _loadMatches(); });
+      } else {
+        Navigator.push(
+          context,
+          MaterialPageRoute(
+            builder: (_) => ScorecardScreen(matchId: id, teamA: teamA, teamB: teamB),
+          ),
+        ).then((_) { if (mounted) _loadMatches(); });
+      }
     } else {
-      // Non-creator tapping a live/pending match → read-only scorecard.
+      // Fallback: show scorecard for any unknown status.
       Navigator.push(
         context,
         MaterialPageRoute(
@@ -291,6 +304,7 @@ class _QuickMatchTabState extends State<_QuickMatchTab> {
   }
 
   Future<void> _syncNow() async {
+    final c = Theme.of(context).appColors;
     try {
       final result = await SyncService.instance.syncAll();
       if (!mounted) return;
@@ -298,7 +312,7 @@ class _QuickMatchTabState extends State<_QuickMatchTab> {
         result.totalSynced > 0
             ? 'Synced ${result.totalSynced} items to cloud'
             : 'Everything up to date',
-        result.totalSynced > 0 ? _accentGreenMid : _textSecondary,
+        result.totalSynced > 0 ? c.accentGreen : c.textSecondary,
         Icons.cloud_done,
       );
     } catch (e) {
@@ -325,37 +339,44 @@ class _QuickMatchTabState extends State<_QuickMatchTab> {
 
   @override
   Widget build(BuildContext context) {
+    final c = Theme.of(context).appColors;
     return CustomScrollView(
       slivers: [
-        _buildAppBar(),
-        SliverToBoxAdapter(child: _buildSearchBar()),
+        _buildAppBar(c),
         SliverPadding(
           padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
           sliver: _loading
-              ? const SliverFillRemaining(
-                  child: Center(child: CircularProgressIndicator(color: _accentGreen)),
+              ? SliverFillRemaining(
+                  child: Center(child: CircularProgressIndicator(color: c.accentGreen)),
                 )
-              : _buildContent(),
+              : _buildContent(c),
         ),
       ],
     );
   }
 
-  Widget _buildAppBar() {
+  Widget _buildAppBar(AppColors c) {
     return SliverAppBar(
       expandedHeight: 130,
       floating: false,
       pinned: true,
-      backgroundColor: _surfaceDark,
+      backgroundColor: c.surface,
       automaticallyImplyLeading: false,
+      leading: Builder(
+        builder: (ctx) => IconButton(
+          icon: Icon(Icons.menu, color: c.textSecondary, size: 22),
+          onPressed: () => Scaffold.of(ctx).openDrawer(),
+          tooltip: 'Menu',
+        ),
+      ),
       flexibleSpace: FlexibleSpaceBar(
         centerTitle: true,
         background: Container(
-          decoration: const BoxDecoration(
+          decoration: BoxDecoration(
             gradient: LinearGradient(
               begin: Alignment.topLeft,
               end: Alignment.bottomRight,
-              colors: [Color(0xFF0F1F0F), Color(0xFF0A0A0A)],
+              colors: [c.surface, c.card],
             ),
           ),
         ),
@@ -363,11 +384,11 @@ class _QuickMatchTabState extends State<_QuickMatchTab> {
           mainAxisSize: MainAxisSize.min,
           children: [
             Text(
-              'Wicket.pk',
+              'BooknScore',
               style: GoogleFonts.rajdhani(
                 fontSize: 26,
                 fontWeight: FontWeight.w900,
-                color: _textPrimary,
+                color: c.textPrimary,
                 letterSpacing: 2,
               ),
             ),
@@ -376,7 +397,7 @@ class _QuickMatchTabState extends State<_QuickMatchTab> {
               style: GoogleFonts.rajdhani(
                 fontSize: 9,
                 fontWeight: FontWeight.w700,
-                color: _accentGreen,
+                color: c.accentGreen,
                 letterSpacing: 3.5,
               ),
             ),
@@ -384,18 +405,13 @@ class _QuickMatchTabState extends State<_QuickMatchTab> {
         ),
       ),
       actions: [
-        _buildSyncButton(),
-        IconButton(
-          icon: const Icon(Icons.logout, color: Colors.white54, size: 20),
-          onPressed: _showLogoutDialog,
-          tooltip: 'Sign out',
-        ),
+        _buildSyncButton(c),
         const SizedBox(width: 4),
       ],
     );
   }
 
-  Widget _buildSyncButton() {
+  Widget _buildSyncButton(AppColors c) {
     if (_syncStatus == SyncState.syncing) {
       return const Padding(
         padding: EdgeInsets.symmetric(horizontal: 12, vertical: 14),
@@ -408,93 +424,87 @@ class _QuickMatchTabState extends State<_QuickMatchTab> {
     IconData icon;
     Color color;
     switch (_syncStatus) {
-      case SyncState.synced:  icon = Icons.cloud_done;  color = _accentGreenMid; break;
-      case SyncState.offline: icon = Icons.cloud_off;   color = Colors.white38;  break;
+      case SyncState.synced:  icon = Icons.cloud_done;  color = c.accentGreen; break;
+      case SyncState.offline: icon = Icons.cloud_off;   color = c.textSecondary; break;
       case SyncState.error:   icon = Icons.cloud_sync;  color = Colors.orange;   break;
-      default:                icon = Icons.cloud_queue; color = Colors.white54;
+      default:                icon = Icons.cloud_queue; color = c.textSecondary;
     }
     return IconButton(icon: Icon(icon, color: color), onPressed: _syncNow);
   }
 
-  Widget _buildSearchBar() {
-    return Padding(
-      padding: const EdgeInsets.fromLTRB(16, 14, 16, 6),
-      child: TextField(
-        controller: _searchCtrl,
-        style: GoogleFonts.rajdhani(fontSize: 15, color: _textPrimary),
-        decoration: InputDecoration(
-          hintText: 'Search quick matches...',
-          hintStyle: GoogleFonts.rajdhani(fontSize: 15, color: _textSecondary),
-          prefixIcon: const Icon(Icons.search, color: _accentGreenMid, size: 20),
-          suffixIcon: _searchQuery.isNotEmpty
-              ? IconButton(
-                  icon: const Icon(Icons.clear, color: _textSecondary, size: 18),
-                  onPressed: _searchCtrl.clear,
-                )
-              : null,
-          filled: true,
-          fillColor: _surfaceCard,
-          contentPadding: const EdgeInsets.symmetric(vertical: 12),
-          enabledBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(12),
-            borderSide: const BorderSide(color: Color(0xFF2A2A2A)),
-          ),
-          focusedBorder: OutlineInputBorder(
-            borderRadius: BorderRadius.circular(12),
-            borderSide: const BorderSide(color: _accentGreen, width: 1.5),
-          ),
-        ),
+  Widget _buildContent(AppColors c) {
+    if (_matches.isEmpty) return _buildEmptyState(c);
+
+    return SliverList(
+      delegate: SliverChildBuilderDelegate(
+        (ctx, i) {
+          // Index 0: section header
+          if (i == 0) {
+            return Padding(
+              padding: const EdgeInsets.only(top: 18, bottom: 10),
+              child: Row(
+                children: [
+                  Container(
+                    width: 3,
+                    height: 18,
+                    decoration: BoxDecoration(
+                      color: c.accentGreen,
+                      borderRadius: BorderRadius.circular(2),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Text(
+                    'RECENT MATCHES',
+                    style: GoogleFonts.rajdhani(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w700,
+                      color: c.textSecondary,
+                      letterSpacing: 2.5,
+                    ),
+                  ),
+                  const Spacer(),
+                  GestureDetector(
+                    onTap: () => Scaffold.of(ctx).openDrawer(),
+                    child: Text(
+                      'See all',
+                      style: GoogleFonts.rajdhani(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w700,
+                        color: c.accentGreen,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            );
+          }
+          // Indices 1..N: match cards
+          final m = _matches[i - 1];
+          return _matchCard(ctx, m, c);
+        },
+        childCount: _matches.length + 1, // +1 for header
       ),
     );
   }
 
-  Widget _buildContent() {
-    final matches = _filtered;
-    if (matches.isEmpty) return _buildEmptyState();
-
-    final live = matches.where((m) =>
-      m[DatabaseHelper.colStatus] == 'live' || m[DatabaseHelper.colStatus] == 'pending'
-    ).toList();
-    final done = matches.where((m) => m[DatabaseHelper.colStatus] == 'completed').toList();
-
-    return SliverList(
-      delegate: SliverChildListDelegate([
-        if (live.isNotEmpty) ...[
-          _sectionHeader('LIVE MATCHES', _liveRed),
-          const SizedBox(height: 10),
-          ...live.map((m) => _matchCard(m)),
-          const SizedBox(height: 20),
-        ],
-        if (done.isNotEmpty) ...[
-          _sectionHeader('RECENT MATCHES', _completedBlue),
-          const SizedBox(height: 10),
-          ...done.map((m) => _matchCard(m)),
-        ],
-        const SizedBox(height: 110),
-      ]),
-    );
-  }
-
-  Widget _buildEmptyState() {
+  Widget _buildEmptyState(AppColors c) {
     return SliverFillRemaining(
       child: Center(
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Icon(Icons.sports_cricket, size: 72, color: _accentGreen.withAlpha(60)),
+            Icon(Icons.sports_cricket, size: 72, color: c.accentGreen.withAlpha(60)),
             const SizedBox(height: 20),
             Text(
-              _searchQuery.isNotEmpty ? 'No results found' : 'No Quick Matches Yet',
+              'No Matches Yet',
               style: GoogleFonts.rajdhani(
-                fontSize: 22, fontWeight: FontWeight.w700, color: _textSecondary,
+                fontSize: 22, fontWeight: FontWeight.w700, color: c.textSecondary,
               ),
             ),
             const SizedBox(height: 8),
             Text(
-              _searchQuery.isNotEmpty
-                  ? 'Try a different search.'
-                  : 'Tap "Quick Match" below to start scoring.',
-              style: GoogleFonts.rajdhani(fontSize: 14, color: _textSecondary),
+              'Tap "Quick Match" below to start your first match.',
+              style: GoogleFonts.rajdhani(fontSize: 14, color: c.textSecondary),
               textAlign: TextAlign.center,
             ),
             const SizedBox(height: 110),
@@ -504,32 +514,15 @@ class _QuickMatchTabState extends State<_QuickMatchTab> {
     );
   }
 
-  Widget _sectionHeader(String title, Color accent) {
-    return Row(
-      children: [
-        Container(
-          width: 3, height: 18,
-          decoration: BoxDecoration(color: accent, borderRadius: BorderRadius.circular(2)),
-        ),
-        const SizedBox(width: 10),
-        Text(
-          title,
-          style: GoogleFonts.rajdhani(
-            fontSize: 11, fontWeight: FontWeight.w700,
-            color: _textSecondary, letterSpacing: 2.5,
-          ),
-        ),
-      ],
-    );
-  }
-
-  Widget _matchCard(Map<String, dynamic> match) {
+  Widget _matchCard(BuildContext ctx, Map<String, dynamic> match, AppColors c) {
     final id     = match[DatabaseHelper.colId]       as int;
     final teamA  = match[DatabaseHelper.colTeamA]    as String;
     final teamB  = match[DatabaseHelper.colTeamB]    as String;
     final overs  = match[DatabaseHelper.colTotalOvers] as int;
     final status = match[DatabaseHelper.colStatus]   as String;
     final created = match[DatabaseHelper.colCreatedAt] as String?;
+
+    final isOngoing = status == 'live' || status == 'ongoing' || status == 'pending';
 
     return Padding(
       padding: const EdgeInsets.only(bottom: 10),
@@ -545,7 +538,7 @@ class _QuickMatchTabState extends State<_QuickMatchTab> {
                   const Spacer(),
                   if (created != null)
                     Text(_relDate(created),
-                        style: GoogleFonts.rajdhani(fontSize: 11, color: _textSecondary)),
+                        style: GoogleFonts.rajdhani(fontSize: 11, color: c.textSecondary)),
                 ],
               ),
               const SizedBox(height: 14),
@@ -553,11 +546,11 @@ class _QuickMatchTabState extends State<_QuickMatchTab> {
               const SizedBox(height: 10),
               Row(
                 children: [
-                  const Icon(Icons.timer_outlined, size: 13, color: _textSecondary),
+                  Icon(Icons.timer_outlined, size: 13, color: c.textSecondary),
                   const SizedBox(width: 5),
                   Text('$overs overs',
                       style: GoogleFonts.rajdhani(
-                          fontSize: 13, color: _textSecondary, fontWeight: FontWeight.w600)),
+                          fontSize: 13, color: c.textSecondary, fontWeight: FontWeight.w600)),
                   const Spacer(),
                   if (status == 'completed')
                     GestureDetector(
@@ -567,49 +560,42 @@ class _QuickMatchTabState extends State<_QuickMatchTab> {
                       child: Container(
                         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                         decoration: BoxDecoration(
-                          color: _completedBlue.withAlpha(25),
+                          color: c.completedBlue.withAlpha(25),
                           borderRadius: BorderRadius.circular(6),
-                          border: Border.all(color: _completedBlue.withAlpha(70)),
+                          border: Border.all(color: c.completedBlue.withAlpha(70)),
                         ),
                         child: Row(mainAxisSize: MainAxisSize.min, children: [
-                          const Icon(Icons.bar_chart, size: 13, color: _completedBlue),
+                          Icon(Icons.bar_chart, size: 13, color: c.completedBlue),
                           const SizedBox(width: 4),
                           Text('Summary',
                               style: GoogleFonts.rajdhani(
-                                  fontSize: 11, fontWeight: FontWeight.w700, color: _completedBlue)),
+                                  fontSize: 11, fontWeight: FontWeight.w700, color: c.completedBlue)),
                         ]),
                       ),
                     ),
+                  if (isOngoing)
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                      decoration: BoxDecoration(
+                        color: c.liveRed.withAlpha(20),
+                        borderRadius: BorderRadius.circular(6),
+                        border: Border.all(color: c.liveRed.withAlpha(60)),
+                      ),
+                      child: Row(mainAxisSize: MainAxisSize.min, children: [
+                        Icon(Icons.play_circle_outline, size: 13, color: c.liveRed),
+                        const SizedBox(width: 4),
+                        Text('Resume',
+                            style: GoogleFonts.rajdhani(
+                                fontSize: 11, fontWeight: FontWeight.w700, color: c.liveRed)),
+                      ]),
+                    ),
                   const SizedBox(width: 8),
-                  const Icon(Icons.arrow_forward_ios, size: 13, color: _accentGreenMid),
+                  Icon(Icons.arrow_forward_ios, size: 13, color: c.accentGreen),
                 ],
               ),
             ],
           ),
         ),
-      ),
-    );
-  }
-
-  void _showLogoutDialog() {
-    showDialog(
-      context: context,
-      builder: (_) => AlertDialog(
-        backgroundColor: _surfaceCard2,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: Text('Sign Out', style: GoogleFonts.rajdhani(fontWeight: FontWeight.w700, color: _textPrimary)),
-        content: Text('Are you sure you want to sign out?',
-            style: GoogleFonts.rajdhani(color: _textSecondary)),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: Text('Cancel', style: GoogleFonts.rajdhani(color: _textSecondary, fontWeight: FontWeight.w600)),
-          ),
-          TextButton(
-            onPressed: () async { Navigator.pop(context); await AuthService.instance.signOut(); },
-            child: Text('Sign Out', style: GoogleFonts.rajdhani(color: Colors.redAccent, fontWeight: FontWeight.w700)),
-          ),
-        ],
       ),
     );
   }
@@ -649,6 +635,7 @@ class _TournamentsTabState extends State<_TournamentsTab> {
 
   @override
   Widget build(BuildContext context) {
+    final c = Theme.of(context).appColors;
     return Consumer<TournamentProvider>(
       builder: (context, provider, _) {
         return CustomScrollView(
@@ -656,7 +643,7 @@ class _TournamentsTabState extends State<_TournamentsTab> {
             // App bar
             SliverAppBar(
               pinned: true,
-              backgroundColor: _surfaceDark,
+              backgroundColor: c.surface,
               automaticallyImplyLeading: false,
               title: Column(
                 mainAxisSize: MainAxisSize.min,
@@ -664,19 +651,19 @@ class _TournamentsTabState extends State<_TournamentsTab> {
                 children: [
                   Text('Tournaments',
                       style: GoogleFonts.rajdhani(
-                          fontSize: 24, fontWeight: FontWeight.w900, color: _textPrimary)),
+                          fontSize: 24, fontWeight: FontWeight.w900, color: c.textPrimary)),
                   Text('LEAGUE & KNOCKOUT ENGINE',
                       style: GoogleFonts.rajdhani(
                           fontSize: 9, fontWeight: FontWeight.w700,
-                          color: _trophyGold, letterSpacing: 3)),
+                          color: c.trophyGold, letterSpacing: 3)),
                 ],
               ),
             ),
 
             // Content
             if (provider.isLoading)
-              const SliverFillRemaining(
-                child: Center(child: CircularProgressIndicator(color: _accentGreen)),
+              SliverFillRemaining(
+                child: Center(child: CircularProgressIndicator(color: c.accentGreen)),
               )
             else if (provider.tournaments.isEmpty)
               SliverFillRemaining(
@@ -684,14 +671,17 @@ class _TournamentsTabState extends State<_TournamentsTab> {
                   child: Column(
                     mainAxisAlignment: MainAxisAlignment.center,
                     children: [
-                      Icon(Icons.emoji_events, size: 72, color: _trophyGold.withAlpha(60)),
+                      Icon(Icons.emoji_events, size: 72, color: c.trophyGold.withAlpha(60)),
                       const SizedBox(height: 20),
                       Text('No Tournaments Yet',
                           style: GoogleFonts.rajdhani(
-                              fontSize: 22, fontWeight: FontWeight.w700, color: _textSecondary)),
+                              fontSize: 22, fontWeight: FontWeight.w700, color: c.textSecondary)),
                       const SizedBox(height: 8),
-                      Text('Tap "Create Tournament" below.',
-                          style: GoogleFonts.rajdhani(fontSize: 14, color: _textSecondary)),
+                      Text(
+                        "You haven't created any tournaments yet. Tap + to start one.",
+                        style: GoogleFonts.rajdhani(fontSize: 14, color: c.textSecondary),
+                        textAlign: TextAlign.center,
+                      ),
                       const SizedBox(height: 110),
                     ],
                   ),
@@ -702,7 +692,7 @@ class _TournamentsTabState extends State<_TournamentsTab> {
                 padding: const EdgeInsets.fromLTRB(16, 12, 16, 110),
                 sliver: SliverList(
                   delegate: SliverChildBuilderDelegate(
-                    (_, i) => _tournamentCard(provider.tournaments[i]),
+                    (_, i) => _tournamentCard(provider.tournaments[i], c),
                     childCount: provider.tournaments.length,
                   ),
                 ),
@@ -713,7 +703,7 @@ class _TournamentsTabState extends State<_TournamentsTab> {
     );
   }
 
-  Widget _tournamentCard(Map<String, dynamic> t) {
+  Widget _tournamentCard(Map<String, dynamic> t, AppColors c) {
     final id     = t[DatabaseHelper.colId]    as int;
     final name   = t[DatabaseHelper.colName]  as String;
     final format = t[DatabaseHelper.colFormat] as String? ?? 'league';
@@ -729,7 +719,7 @@ class _TournamentsTabState extends State<_TournamentsTab> {
           MaterialPageRoute(builder: (_) => TournamentDashboardScreen(tournamentId: id)),
         ).then((_) => _load()),
         child: _PremiumCard(
-          accentColor: _trophyGold,
+          accentColor: c.trophyGold,
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -739,20 +729,20 @@ class _TournamentsTabState extends State<_TournamentsTab> {
                     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                     decoration: BoxDecoration(
                       color: status == 'active'
-                          ? _accentGreen.withAlpha(25)
-                          : _completedBlue.withAlpha(25),
+                          ? c.accentGreen.withAlpha(25)
+                          : c.completedBlue.withAlpha(25),
                       borderRadius: BorderRadius.circular(6),
                       border: Border.all(
                         color: status == 'active'
-                            ? _accentGreen.withAlpha(80)
-                            : _completedBlue.withAlpha(80),
+                            ? c.accentGreen.withAlpha(80)
+                            : c.completedBlue.withAlpha(80),
                       ),
                     ),
                     child: Text(
                       status == 'active' ? 'ACTIVE' : 'COMPLETED',
                       style: GoogleFonts.rajdhani(
                         fontSize: 10, fontWeight: FontWeight.w700, letterSpacing: 1.5,
-                        color: status == 'active' ? _accentGreen : _completedBlue,
+                        color: status == 'active' ? c.accentGreen : c.completedBlue,
                       ),
                     ),
                   ),
@@ -760,14 +750,14 @@ class _TournamentsTabState extends State<_TournamentsTab> {
                   Container(
                     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                     decoration: BoxDecoration(
-                      color: _trophyGold.withAlpha(20),
+                      color: c.trophyGold.withAlpha(20),
                       borderRadius: BorderRadius.circular(6),
                     ),
                     child: Text(
                       format.toUpperCase(),
                       style: GoogleFonts.rajdhani(
                         fontSize: 10, fontWeight: FontWeight.w700,
-                        letterSpacing: 1.5, color: _trophyGold,
+                        letterSpacing: 1.5, color: c.trophyGold,
                       ),
                     ),
                   ),
@@ -776,13 +766,13 @@ class _TournamentsTabState extends State<_TournamentsTab> {
               const SizedBox(height: 12),
               Row(
                 children: [
-                  const Icon(Icons.emoji_events, size: 20, color: _trophyGold),
+                  Icon(Icons.emoji_events, size: 20, color: c.trophyGold),
                   const SizedBox(width: 8),
                   Expanded(
                     child: Text(
                       name,
                       style: GoogleFonts.rajdhani(
-                        fontSize: 20, fontWeight: FontWeight.w800, color: _textPrimary,
+                        fontSize: 20, fontWeight: FontWeight.w800, color: c.textPrimary,
                       ),
                       overflow: TextOverflow.ellipsis,
                     ),
@@ -796,41 +786,41 @@ class _TournamentsTabState extends State<_TournamentsTab> {
                 children: teams.take(6).map((team) => Container(
                   padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                   decoration: BoxDecoration(
-                    color: _surfaceCard2,
+                    color: c.card2,
                     borderRadius: BorderRadius.circular(20),
-                    border: Border.all(color: const Color(0xFF2A2A2A)),
+                    border: Border.all(color: c.border),
                   ),
                   child: Text(team,
                       style: GoogleFonts.rajdhani(
-                          fontSize: 11, color: _textSecondary, fontWeight: FontWeight.w600)),
+                          fontSize: 11, color: c.textSecondary, fontWeight: FontWeight.w600)),
                 )).toList()
                   ..addAll(teams.length > 6
                       ? [Container(
                           padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
                           decoration: BoxDecoration(
-                            color: _surfaceCard2,
+                            color: c.card2,
                             borderRadius: BorderRadius.circular(20),
                           ),
                           child: Text('+${teams.length - 6} more',
                               style: GoogleFonts.rajdhani(
-                                  fontSize: 11, color: _textSecondary)),
+                                  fontSize: 11, color: c.textSecondary)),
                         )]
                       : []),
               ),
               const SizedBox(height: 10),
               Row(
                 children: [
-                  Icon(Icons.group_outlined, size: 13, color: _textSecondary),
+                  Icon(Icons.group_outlined, size: 13, color: c.textSecondary),
                   const SizedBox(width: 4),
                   Text('${teams.length} teams',
                       style: GoogleFonts.rajdhani(
-                          fontSize: 12, color: _textSecondary, fontWeight: FontWeight.w600)),
+                          fontSize: 12, color: c.textSecondary, fontWeight: FontWeight.w600)),
                   const Spacer(),
                   Text('View Dashboard',
                       style: GoogleFonts.rajdhani(
-                          fontSize: 12, fontWeight: FontWeight.w700, color: _trophyGold)),
+                          fontSize: 12, fontWeight: FontWeight.w700, color: c.trophyGold)),
                   const SizedBox(width: 4),
-                  const Icon(Icons.arrow_forward_ios, size: 12, color: _trophyGold),
+                  Icon(Icons.arrow_forward_ios, size: 12, color: c.trophyGold),
                 ],
               ),
             ],
@@ -853,7 +843,8 @@ class _PremiumCard extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final border = accentColor ?? _accentGreen;
+    final c = Theme.of(context).appColors;
+    final border = accentColor ?? c.accentGreen;
     return ClipRRect(
       borderRadius: BorderRadius.circular(16),
       child: BackdropFilter(
@@ -861,7 +852,7 @@ class _PremiumCard extends StatelessWidget {
         child: Container(
           padding: const EdgeInsets.all(18),
           decoration: BoxDecoration(
-            color: _surfaceCard.withAlpha(230),
+            color: c.card.withAlpha(230),
             borderRadius: BorderRadius.circular(16),
             border: Border.all(color: border.withAlpha(40), width: 1),
             boxShadow: [
@@ -886,12 +877,13 @@ class _TeamsRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final c = Theme.of(context).appColors;
     return Row(
       children: [
         Expanded(
           child: Text(teamA,
               style: GoogleFonts.rajdhani(
-                  fontSize: 18, fontWeight: FontWeight.w800, color: _textPrimary),
+                  fontSize: 18, fontWeight: FontWeight.w800, color: c.textPrimary),
               overflow: TextOverflow.ellipsis),
         ),
         Padding(
@@ -899,13 +891,13 @@ class _TeamsRow extends StatelessWidget {
           child: Text('VS',
               style: GoogleFonts.rajdhani(
                   fontSize: 13, fontWeight: FontWeight.w900,
-                  color: _accentGreen, letterSpacing: 2)),
+                  color: c.accentGreen, letterSpacing: 2)),
         ),
         Expanded(
           child: Text(teamB,
               textAlign: TextAlign.right,
               style: GoogleFonts.rajdhani(
-                  fontSize: 18, fontWeight: FontWeight.w800, color: _textPrimary),
+                  fontSize: 18, fontWeight: FontWeight.w800, color: c.textPrimary),
               overflow: TextOverflow.ellipsis),
         ),
       ],
@@ -919,15 +911,17 @@ class _StatusBadge extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final c = Theme.of(context).appColors;
     Color bg, fg;
     String label;
     switch (status) {
       case 'live':
-        bg = _liveRed.withAlpha(30); fg = _liveRed; label = 'LIVE'; break;
+      case 'ongoing':
+        bg = c.liveRed.withAlpha(30); fg = c.liveRed; label = 'LIVE'; break;
       case 'completed':
-        bg = _completedBlue.withAlpha(30); fg = _completedBlue; label = 'COMPLETED'; break;
+        bg = c.completedBlue.withAlpha(30); fg = c.completedBlue; label = 'COMPLETED'; break;
       default:
-        bg = _accentGreen.withAlpha(20); fg = _accentGreen; label = 'PENDING';
+        bg = c.accentGreen.withAlpha(20); fg = c.accentGreen; label = 'PENDING';
     }
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 3),
@@ -943,8 +937,8 @@ class _StatusBadge extends StatelessWidget {
               width: 5, height: 5,
               margin: const EdgeInsets.only(right: 5),
               decoration: BoxDecoration(
-                color: _liveRed, shape: BoxShape.circle,
-                boxShadow: [BoxShadow(color: _liveRed.withAlpha(140), blurRadius: 4)],
+                color: c.liveRed, shape: BoxShape.circle,
+                boxShadow: [BoxShadow(color: c.liveRed.withAlpha(140), blurRadius: 4)],
               ),
             ),
           ],

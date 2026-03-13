@@ -37,39 +37,44 @@ class ScoringScreen extends StatefulWidget {
 
 class _ScoringScreenState extends State<ScoringScreen> {
   // Track which dialogs are currently showing to prevent duplicates
+  bool _isShowingTossDialog = false;
   bool _isShowingOpeningDialog = false;
   bool _isShowingBatterDialog = false;
   bool _isShowingBowlerDialog = false;
   bool _isShowingInningsDialog = false;
-  
+
+  /// Initialization lock — prevents loadMatch() from being called more than
+  /// once per ScoringScreen instance, regardless of Flutter lifecycle events,
+  /// widget rebuilds, or hot-reload.  Set to true the first time initState
+  /// fires; any subsequent calls (e.g. from didUpdateWidget) are no-ops.
+  bool _isStateLoaded = false;
+
   late MatchProvider _provider;
 
   @override
   void initState() {
     super.initState();
+    // Guard: only load state once per screen instance.
+    if (_isStateLoaded) return;
+    _isStateLoaded = true;
+
     WidgetsBinding.instance.addPostFrameCallback((_) {
       if (!mounted) return;
       _provider = context.read<MatchProvider>();
       _provider.addListener(_onProviderChanged);
-      if (_provider.matchId != widget.matchId) {
-        _provider.loadMatch(widget.matchId).then((_) {
-          // After the match finishes loading, immediately check whether
-          // the opening players dialog is needed. This handles the case
-          // where the provider may not fire a change notification that
-          // the listener catches in time (e.g. first-ever load).
-          if (!mounted) return;
-          WidgetsBinding.instance.addPostFrameCallback((_) {
-            if (!mounted) return;
-            _checkAndShowDialogs();
-          });
-        });
-      } else {
-        // Match already loaded — check right now in case it needs players.
+      // Strict load sequence:
+      //   1. Wipe state clean  – prevent dirty state from a previous session
+      //      causing totals to double-accumulate when the screen is re-opened.
+      //   2. Fetch DB history  – loadMatch() reads ball_events from SQLite.
+      //   3. Rebuild live score – loadMatch() derives all totals from that history.
+      _provider.resetState();
+      _provider.loadMatch(widget.matchId).then((_) {
+        if (!mounted) return;
         WidgetsBinding.instance.addPostFrameCallback((_) {
           if (!mounted) return;
           _checkAndShowDialogs();
         });
-      }
+      });
     });
   }
 
@@ -98,11 +103,35 @@ class _ScoringScreenState extends State<ScoringScreen> {
     if (!mounted) return;
     
     final provider = context.read<MatchProvider>();
-    
+
+    // Absolute guard: provider must have a fully-loaded match before we
+    // attempt any dialog logic. If the match map is null the data is still
+    // loading and we must not infer anything from default/empty values.
+    if (provider.match == null) return;
+
     // Match is over — no dialogs needed; the build() will show the
     // completion screen automatically via the matchEnded branch.
-    if (provider.matchEnded || provider.matchStatus == 'completed') return;
-    
+    if (provider.matchEnded) return;
+
+    // Read status directly from the raw map so we are never fooled by the
+    // provider getter's 'pending' default that fires when _match is null.
+    final matchStatus = provider.match![DatabaseHelper.colStatus] as String? ?? '';
+
+    // Hard stop for completed matches — no dialogs of any kind.
+    if (matchStatus == 'completed') return;
+
+    // Toss must be recorded before anything else.
+    // Only show for matches that have not yet started (pending/not_started).
+    // The isNewMatch guard already excludes 'live' matches so no separate
+    // 'live' early-return is needed here — doing so would also block the
+    // end-of-over bowler dialog and new-batter dialog during live play.
+    final tossWinner = provider.match![DatabaseHelper.colTossWinner];
+    final isNewMatch = matchStatus == 'pending' || matchStatus == 'not_started' || matchStatus == '';
+    if (tossWinner == null && isNewMatch && !_isShowingTossDialog) {
+      _showTossDialog();
+      return;
+    }
+
     // Priority order: Opening players > New batter > New bowler > Innings change
     if (provider.needsOpeningPlayers && !_isShowingOpeningDialog) {
       _showOpeningPlayersDialog();
@@ -199,13 +228,6 @@ class _ScoringScreenState extends State<ScoringScreen> {
 
               // ── Divider ─────────────────────────────────────────────────
               const _Divider(),
-
-              // ── Commentary Feed ──────────────────────────────────────────
-              Selector<MatchProvider, List<String>>(
-                selector: (_, p) => p.commentary,
-                shouldRebuild: (prev, next) => prev.length != next.length,
-                builder: (ctx, feed, _) => _CommentaryFeed(entries: feed),
-              ),
 
               // ── Bottom: Scoring Panel — targeted Selector rebuild ───────
               Expanded(
@@ -631,6 +653,24 @@ class _ScoringScreenState extends State<ScoringScreen> {
 
   void _handleUndo(MatchProvider provider) async {
     if (provider.isProcessing) return;
+
+    // Strict undo lock: only allow undoing balls in the current over.
+    if (provider.ballsInCurrentOver == 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Cannot undo — no balls bowled in the current over.',
+            style: GoogleFonts.rajdhani(fontWeight: FontWeight.w600),
+          ),
+          backgroundColor: Colors.orange.shade800,
+          duration: const Duration(seconds: 2),
+          behavior: SnackBarBehavior.floating,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+          margin: const EdgeInsets.all(16),
+        ),
+      );
+      return;
+    }
     
     final confirmed = await showDialog<bool>(
       context: context,
@@ -754,6 +794,156 @@ class _ScoringScreenState extends State<ScoringScreen> {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
+  // TOSS DIALOG
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  void _showTossDialog() {
+    if (!mounted || _isShowingTossDialog) return;
+
+    // Absolute failsafe: never show toss dialog for completed/live matches
+    // or if toss has already been recorded — even if called erroneously.
+    final provider = context.read<MatchProvider>();
+    if (provider.match == null) return;
+    final _status = provider.match![DatabaseHelper.colStatus] as String? ?? '';
+    final _tossWinner = provider.match![DatabaseHelper.colTossWinner];
+    if (_status == 'completed' || _status == 'live' || _tossWinner != null) return;
+
+    _isShowingTossDialog = true;
+
+    final teamA = provider.teamA;
+    final teamB = provider.teamB;
+    String? selectedWinner;
+    String? selectedOpt; // 'bat' or 'bowl'
+
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setLocal) {
+          return AlertDialog(
+            backgroundColor: _surfaceCard,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(16),
+              side: const BorderSide(color: _glassBorder, width: 1),
+            ),
+            title: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Toss',
+                  style: GoogleFonts.rajdhani(
+                    fontSize: 22, fontWeight: FontWeight.w900,
+                    color: _textPrimary, letterSpacing: 1,
+                  ),
+                ),
+                Text(
+                  'Record the toss result before scoring',
+                  style: GoogleFonts.rajdhani(
+                    fontSize: 13, color: _textSecondary,
+                  ),
+                ),
+              ],
+            ),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Who won the toss?',
+                  style: GoogleFonts.rajdhani(
+                    fontSize: 14, fontWeight: FontWeight.w700,
+                    color: _textSecondary, letterSpacing: 1,
+                  ),
+                ),
+                const SizedBox(height: 10),
+                Row(
+                  children: [
+                    Expanded(
+                      child: _TossOptionButton(
+                        label: teamA,
+                        selected: selectedWinner == teamA,
+                        onTap: () => setLocal(() => selectedWinner = teamA),
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: _TossOptionButton(
+                        label: teamB,
+                        selected: selectedWinner == teamB,
+                        onTap: () => setLocal(() => selectedWinner = teamB),
+                      ),
+                    ),
+                  ],
+                ),
+                if (selectedWinner != null) ...[
+                  const SizedBox(height: 18),
+                  Text(
+                    'Elected to…',
+                    style: GoogleFonts.rajdhani(
+                      fontSize: 14, fontWeight: FontWeight.w700,
+                      color: _textSecondary, letterSpacing: 1,
+                    ),
+                  ),
+                  const SizedBox(height: 10),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _TossOptionButton(
+                          label: 'Bat',
+                          icon: Icons.sports_cricket,
+                          selected: selectedOpt == 'bat',
+                          onTap: () => setLocal(() => selectedOpt = 'bat'),
+                        ),
+                      ),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: _TossOptionButton(
+                          label: 'Bowl',
+                          icon: Icons.sports_baseball,
+                          selected: selectedOpt == 'bowl',
+                          onTap: () => setLocal(() => selectedOpt = 'bowl'),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ],
+            ),
+            actions: [
+              TextButton(
+                onPressed: (selectedWinner != null && selectedOpt != null)
+                    ? () async {
+                        Navigator.pop(ctx);
+                        await DatabaseHelper.instance.updateMatchToss(
+                          widget.matchId,
+                          selectedWinner!,
+                          selectedOpt!,
+                        );
+                        if (mounted) {
+                          await context.read<MatchProvider>().loadMatch(widget.matchId);
+                        }
+                      }
+                    : null,
+                child: Text(
+                  'Confirm',
+                  style: GoogleFonts.rajdhani(
+                    fontSize: 15, fontWeight: FontWeight.w700,
+                    color: (selectedWinner != null && selectedOpt != null)
+                        ? _accentGreen
+                        : _textSecondary,
+                  ),
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    ).then((_) {
+      _isShowingTossDialog = false;
+    });
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
   // OPENING PLAYERS DIALOG (Striker, Non-Striker, Opening Bowler)
   // ═══════════════════════════════════════════════════════════════════════════
 
@@ -789,6 +979,7 @@ class _ScoringScreenState extends State<ScoringScreen> {
       backgroundColor: Colors.transparent,
       isScrollControlled: true,
       builder: (ctx) => _NewBatterModal(
+        isRetirement: context.read<MatchProvider>().newBatterIsRetirement,
         onDismissed: () {
           _isShowingBatterDialog = false;
         },
@@ -829,14 +1020,24 @@ class _ScoringScreenState extends State<ScoringScreen> {
   void _showInningsChangeModal() {
     if (!mounted || _isShowingInningsDialog) return;
     _isShowingInningsDialog = true;
-    
+
+    // ── Snapshot provider state NOW, before endInnings() resets _totalRuns ──
+    // The dialog builder runs asynchronously; by the time it executes,
+    // endInnings() may have already zeroed out totalRuns/totalWickets.
+    // Capturing these values here guarantees the dialog always shows the
+    // correct innings-1 totals.
+    final provider       = context.read<MatchProvider>();
+    final inn1Runs       = provider.totalRuns;
+    final inn1Wickets    = provider.totalWickets;
+    final inn1OversStr   = provider.oversDisplay;
+    final inn1BattingTeam  = provider.battingTeam;
+    final inn1BowlingTeam  = provider.bowlingTeam;
+    final target         = inn1Runs + 1;
+
     showDialog(
       context: context,
       barrierDismissible: false,
       builder: (ctx) {
-        // Read provider with listen: false to avoid registering the dialog as a listener
-        final provider = ctx.read<MatchProvider>();
-        
         return AlertDialog(
           backgroundColor: _surfaceCard,
           shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
@@ -877,7 +1078,7 @@ class _ScoringScreenState extends State<ScoringScreen> {
                 child: Column(
                   children: [
                     Text(
-                      provider.battingTeam.toUpperCase(),
+                      inn1BattingTeam.toUpperCase(),
                       style: GoogleFonts.rajdhani(
                         fontSize: 12,
                         fontWeight: FontWeight.w700,
@@ -887,7 +1088,7 @@ class _ScoringScreenState extends State<ScoringScreen> {
                     ),
                     const SizedBox(height: 4),
                     Text(
-                      '${provider.totalRuns}/${provider.totalWickets}',
+                      '$inn1Runs/$inn1Wickets',
                       style: GoogleFonts.rajdhani(
                         fontSize: 42,
                         fontWeight: FontWeight.w900,
@@ -895,7 +1096,7 @@ class _ScoringScreenState extends State<ScoringScreen> {
                       ),
                     ),
                     Text(
-                      '(${provider.oversDisplay} overs)',
+                      '($inn1OversStr overs)',
                       style: GoogleFonts.rajdhani(
                         fontSize: 14,
                         color: _textSecondary,
@@ -921,7 +1122,7 @@ class _ScoringScreenState extends State<ScoringScreen> {
                     const SizedBox(width: 10),
                     Expanded(
                       child: Text(
-                        '${provider.bowlingTeam} needs ${provider.totalRuns + 1} to win',
+                        '$inn1BowlingTeam needs $target to win',
                         style: GoogleFonts.rajdhani(
                           fontSize: 14,
                           fontWeight: FontWeight.w700,
@@ -940,17 +1141,14 @@ class _ScoringScreenState extends State<ScoringScreen> {
               height: 48,
               child: ElevatedButton.icon(
                 onPressed: () {
-                  // 1. Capture provider reference BEFORE closing the dialog
-                  final providerRef = provider;
-                  
-                  // 2. Safely close the dialog first
+                  // 1. Safely close the dialog first
                   if (ctx.mounted) {
                     Navigator.of(ctx).pop();
                   }
-                  
-                  // 3. Wait for dialog to completely unmount before triggering notifyListeners()
+
+                  // 2. Wait for dialog to completely unmount before triggering notifyListeners()
                   Future.delayed(const Duration(milliseconds: 100), () {
-                    providerRef.endInnings();
+                    provider.endInnings();
                   });
                 },
                 icon: const Icon(Icons.play_arrow),
@@ -1044,62 +1242,6 @@ class _Divider extends StatelessWidget {
   @override
   Widget build(BuildContext context) =>
       const ColoredBox(color: _borderSubtle, child: SizedBox(height: 1, width: double.infinity));
-}
-
-// ══════════════════════════════════════════════════════════════════════════════
-// COMMENTARY FEED
-// ══════════════════════════════════════════════════════════════════════════════
-
-class _CommentaryFeed extends StatelessWidget {
-  const _CommentaryFeed({required this.entries});
-
-  final List<String> entries;
-
-  @override
-  Widget build(BuildContext context) {
-    if (entries.isEmpty) return const SizedBox.shrink();
-
-    return Container(
-      height: 72,
-      color: const Color(0xFF0D0D0D),
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 4),
-      child: ListView.builder(
-        reverse: false,
-        itemCount: entries.length > 5 ? 5 : entries.length,
-        itemBuilder: (_, i) {
-          final text = entries[i];
-          // Highlight special events in different colours
-          final isWicket = text.contains('OUT!');
-          final isSix    = text.contains('SIX!');
-          final isFour   = text.contains('FOUR!');
-
-          final Color textColor = isWicket
-              ? _wicketRed
-              : isSix
-                  ? _strikerGold
-                  : isFour
-                      ? _accentGreen
-                      : _textSecondary;
-
-          return Padding(
-            padding: const EdgeInsets.symmetric(vertical: 1),
-            child: Text(
-              text,
-              style: GoogleFonts.robotoMono(
-                fontSize: 11,
-                color: textColor,
-                fontWeight: (isWicket || isSix || isFour)
-                    ? FontWeight.w700
-                    : FontWeight.w400,
-              ),
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-            ),
-          );
-        },
-      ),
-    );
-  }
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -1285,9 +1427,8 @@ class _ScoreboardPanel extends StatelessWidget {
                     ),
                   ),
                   const Spacer(),
-                  // Retire / Declare button
-                  GestureDetector(
-                    onTap: () => _showRetireDeclareDialog(context),
+                   GestureDetector(
+                    onTap: () => _showManagePlayerSheet(context),
                     child: Container(
                       padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                       decoration: BoxDecoration(
@@ -1298,10 +1439,10 @@ class _ScoreboardPanel extends StatelessWidget {
                       child: Row(
                         mainAxisSize: MainAxisSize.min,
                         children: [
-                          Icon(Icons.logout, color: _wicketRed, size: 12),
+                          Icon(Icons.manage_accounts, color: _wicketRed, size: 12),
                           const SizedBox(width: 4),
                           Text(
-                            'RETIRE / DECLARE',
+                            'MANAGE PLAYER',
                             style: GoogleFonts.rajdhani(
                               fontSize: 9,
                               fontWeight: FontWeight.w700,
@@ -1340,72 +1481,53 @@ class _ScoreboardPanel extends StatelessWidget {
     );
   }
 
-  void _showRetireDeclareDialog(BuildContext context) {
-    showDialog<void>(
+  void _showManagePlayerSheet(BuildContext context) {
+    showModalBottomSheet<void>(
       context: context,
-      builder: (dCtx) => AlertDialog(
-        backgroundColor: _surfaceCard,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        title: Row(
-          children: [
-            Icon(Icons.logout, color: _wicketRed, size: 20),
-            const SizedBox(width: 10),
-            Text(
-              'Retire / Declare',
-              style: GoogleFonts.rajdhani(
-                fontSize: 20,
-                fontWeight: FontWeight.w700,
-                color: _textPrimary,
-              ),
-            ),
-          ],
-        ),
-        content: Text(
-          'Choose an action for the current striker:',
-          style: GoogleFonts.rajdhani(
-            fontSize: 15,
-            color: _textSecondary,
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dCtx),
-            child: Text(
-              'Cancel',
-              style: GoogleFonts.rajdhani(color: _textSecondary, fontWeight: FontWeight.w600),
-            ),
-          ),
-          ElevatedButton(
-            onPressed: () {
-              Navigator.pop(dCtx);
-              provider.recordWicket(wicketType: 'retired_hurt');
-            },
-            style: ElevatedButton.styleFrom(
-              backgroundColor: _extrasAmber,
-              foregroundColor: Colors.black,
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-            ),
-            child: Text(
-              'Retire Hurt',
-              style: GoogleFonts.rajdhani(fontWeight: FontWeight.w700),
-            ),
-          ),
-          ElevatedButton(
-            onPressed: () {
-              Navigator.pop(dCtx);
-              provider.endInnings();
-            },
-            style: ElevatedButton.styleFrom(
-              backgroundColor: _wicketRed,
-              foregroundColor: Colors.white,
-              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
-            ),
-            child: Text(
-              'Declare Innings',
-              style: GoogleFonts.rajdhani(fontWeight: FontWeight.w700),
-            ),
-          ),
-        ],
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true,
+      builder: (sheetCtx) => _ManagePlayerSheet(
+        strikerName: provider.strikerName,
+        onRetireHurt: () {
+          Navigator.pop(sheetCtx);
+          Future.delayed(const Duration(milliseconds: 120), () {
+            provider.retireBatterHurt();
+          });
+        },
+        onRetireOut: () {
+          Navigator.pop(sheetCtx);
+          Future.delayed(const Duration(milliseconds: 120), () {
+            provider.retireBatterOut();
+          });
+        },
+        onChangeBowler: () {
+          Navigator.pop(sheetCtx);
+          Future.delayed(const Duration(milliseconds: 120), () {
+            _showChangeBowlerSheet(context);
+          });
+        },
+        onDeclare: () {
+          Navigator.pop(sheetCtx);
+          Future.delayed(const Duration(milliseconds: 120), () {
+            provider.declareInnings();
+          });
+        },
+      ),
+    );
+  }
+
+  void _showChangeBowlerSheet(BuildContext context) {
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: Colors.transparent,
+      isScrollControlled: true,
+      builder: (sheetCtx) => _ChangeBowlerSheet(
+        onConfirm: (name) {
+          Navigator.pop(sheetCtx);
+          Future.delayed(const Duration(milliseconds: 120), () {
+            provider.changeBowlerMidOver(name);
+          });
+        },
       ),
     );
   }
@@ -1875,34 +1997,39 @@ class _ScoringPanelState extends State<_ScoringPanel> {
               // Section header with extras toggle AND undo button
               Row(
                 children: [
-                  // Undo button (prominent)
-                  GestureDetector(
-                    onTap: widget.onUndo,
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-                      decoration: BoxDecoration(
-                        color: _undoOrange.withAlpha(25),
-                        borderRadius: BorderRadius.circular(8),
-                        border: Border.all(color: _undoOrange.withAlpha(100), width: 1.5),
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(Icons.undo, color: _undoOrange, size: 16),
-                          const SizedBox(width: 6),
-                          Text(
-                            'UNDO',
-                            style: GoogleFonts.rajdhani(
-                              fontSize: 11,
-                              fontWeight: FontWeight.w800,
-                              color: _undoOrange,
-                              letterSpacing: 1,
+                  // Undo button (prominent) — disabled when no balls in current over
+                  Builder(builder: (ctx) {
+                    final canUndo = provider.ballsInCurrentOver > 0;
+                    final btnColor = canUndo ? _undoOrange : Colors.white24;
+                    return GestureDetector(
+                      onTap: canUndo ? widget.onUndo : null,
+                      child: AnimatedContainer(
+                        duration: const Duration(milliseconds: 200),
+                        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                        decoration: BoxDecoration(
+                          color: btnColor.withAlpha(25),
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(color: btnColor.withAlpha(100), width: 1.5),
+                        ),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(Icons.undo, color: btnColor, size: 16),
+                            const SizedBox(width: 6),
+                            Text(
+                              'UNDO',
+                              style: GoogleFonts.rajdhani(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w800,
+                                color: btnColor,
+                                letterSpacing: 1,
+                              ),
                             ),
-                          ),
-                        ],
+                          ],
+                        ),
                       ),
-                    ),
-                  ),
+                    );
+                  }),
                   const Spacer(),
                   
                   Text(
@@ -2231,6 +2358,7 @@ class _ScoringPanelState extends State<_ScoringPanel> {
   void _showRunOutDialog(MatchProvider provider) {
     int _runsCompleted = 0;
     String _runType = 'off_bat'; // 'off_bat' | 'bye' | 'leg_bye'
+    bool _outBatterIsStriker = true; // true = striker out, false = non-striker out
 
     showDialog<void>(
       context: context,
@@ -2263,6 +2391,102 @@ class _ScoringPanelState extends State<_ScoringPanel> {
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
+              // ── Who is out? ───────────────────────────────────────────────
+              Text(
+                'Who is out?',
+                style: GoogleFonts.rajdhani(
+                  color: _textSecondary,
+                  fontSize: 14,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Expanded(
+                    child: GestureDetector(
+                      onTap: () => setDState(() => _outBatterIsStriker = true),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(vertical: 10),
+                        decoration: BoxDecoration(
+                          color: _outBatterIsStriker ? _wicketRed : _surfaceDark,
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(
+                            color: _outBatterIsStriker ? _wicketRed : _borderSubtle,
+                            width: 2,
+                          ),
+                        ),
+                        alignment: Alignment.center,
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              'STRIKER',
+                              style: GoogleFonts.rajdhani(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w700,
+                                color: _outBatterIsStriker ? Colors.white70 : _textSecondary,
+                                letterSpacing: 1,
+                              ),
+                            ),
+                            Text(
+                              provider.strikerName ?? 'Striker',
+                              style: GoogleFonts.rajdhani(
+                                fontSize: 14,
+                                fontWeight: FontWeight.w800,
+                                color: _outBatterIsStriker ? Colors.white : _textSecondary,
+                              ),
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: GestureDetector(
+                      onTap: () => setDState(() => _outBatterIsStriker = false),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(vertical: 10),
+                        decoration: BoxDecoration(
+                          color: !_outBatterIsStriker ? _wicketRed : _surfaceDark,
+                          borderRadius: BorderRadius.circular(8),
+                          border: Border.all(
+                            color: !_outBatterIsStriker ? _wicketRed : _borderSubtle,
+                            width: 2,
+                          ),
+                        ),
+                        alignment: Alignment.center,
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              'NON-STRIKER',
+                              style: GoogleFonts.rajdhani(
+                                fontSize: 11,
+                                fontWeight: FontWeight.w700,
+                                color: !_outBatterIsStriker ? Colors.white70 : _textSecondary,
+                                letterSpacing: 1,
+                              ),
+                            ),
+                            Text(
+                              provider.nonStrikerName ?? 'Non-Striker',
+                              style: GoogleFonts.rajdhani(
+                                fontSize: 14,
+                                fontWeight: FontWeight.w800,
+                                color: !_outBatterIsStriker ? Colors.white : _textSecondary,
+                              ),
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 20),
               Text(
                 'Runs completed before run-out:',
                 style: GoogleFonts.rajdhani(
@@ -2342,6 +2566,7 @@ class _ScoringPanelState extends State<_ScoringPanel> {
                   runsScored: isOffBat ? _runsCompleted : 0,
                   extraType: isOffBat ? null : _runType,
                   extraRuns: isOffBat ? 0 : _runsCompleted,
+                  outBatterIsStriker: _outBatterIsStriker,
                 );
               },
               child: Text(
@@ -3149,9 +3374,10 @@ class _InitialPlayersDialogState extends State<_InitialPlayersDialog> {
 // ══════════════════════════════════════════════════════════════════════════════
 
 class _NewBatterModal extends StatefulWidget {
-  const _NewBatterModal({required this.onDismissed});
+  const _NewBatterModal({required this.onDismissed, this.isRetirement = false});
   
   final VoidCallback onDismissed;
+  final bool isRetirement;
 
   @override
   State<_NewBatterModal> createState() => _NewBatterModalState();
@@ -3174,7 +3400,7 @@ class _NewBatterModalState extends State<_NewBatterModal> {
     final provider = context.read<MatchProvider>();
     final players = await DatabaseHelper.instance.fetchPlayersByTeam(provider.battingTeam);
 
-    // Fetch dismissed player IDs for this innings so we can exclude them.
+    // Fetch dismissed player IDs (out via a ball event) for this innings.
     Set<int> dismissedIds = {};
     if (provider.matchId != null) {
       dismissedIds = await DatabaseHelper.instance.fetchDismissedPlayerIds(
@@ -3183,15 +3409,20 @@ class _NewBatterModalState extends State<_NewBatterModal> {
       );
     }
 
+    // Retired-out players (no ball event but cannot return).
+    final retiredOutIds = provider.retiredOutPlayerIds;
+
     // Also exclude currently active batters (striker & non-striker).
     final activeIds = <int>{
       if (provider.strikerId != null) provider.strikerId!,
       if (provider.nonStrikerId != null) provider.nonStrikerId!,
     };
 
-    // Build dismissed name set for validator (case-insensitive comparison).
+    // Build dismissed-name set for validator — includes both ball-event
+    // dismissals AND retired-out players.
+    final allOutIds = {...dismissedIds, ...retiredOutIds};
     final dismissed = players
-        .where((p) => dismissedIds.contains(p[DatabaseHelper.colId] as int))
+        .where((p) => allOutIds.contains(p[DatabaseHelper.colId] as int))
         .map((p) => (p[DatabaseHelper.colName] as String).toLowerCase())
         .toSet();
 
@@ -3201,7 +3432,10 @@ class _NewBatterModalState extends State<_NewBatterModal> {
       _suggestions = players
           .where((p) {
             final id = p[DatabaseHelper.colId] as int;
-            return !activeIds.contains(id) && !dismissedIds.contains(id);
+            // Exclude active batters and fully out players.
+            // Retired-HURT players (retiredPlayerIds) are NOT excluded — they
+            // can return and should appear as suggestions.
+            return !activeIds.contains(id) && !allOutIds.contains(id);
           })
           .map((p) => p[DatabaseHelper.colName] as String)
           .toList();
@@ -3299,11 +3533,11 @@ class _NewBatterModalState extends State<_NewBatterModal> {
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
                             Text(
-                              'WICKET!',
+                              widget.isRetirement ? 'RETIREMENT' : 'WICKET!',
                               style: GoogleFonts.rajdhani(
                                 fontSize: 10,
                                 fontWeight: FontWeight.w700,
-                                color: _wicketRed,
+                                color: widget.isRetirement ? _extrasAmber : _wicketRed,
                                 letterSpacing: 2,
                               ),
                             ),
@@ -3736,6 +3970,433 @@ class _NewBowlerModalState extends State<_NewBowlerModal> {
                       ),
                       style: ElevatedButton.styleFrom(
                         backgroundColor: _accentGreen,
+                        foregroundColor: Colors.white,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ── Toss Option Button ─────────────────────────────────────────────────────────
+
+class _TossOptionButton extends StatelessWidget {
+  const _TossOptionButton({
+    required this.label,
+    required this.selected,
+    required this.onTap,
+    this.icon,
+  });
+
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+  final IconData? icon;
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 180),
+        padding: const EdgeInsets.symmetric(vertical: 12),
+        decoration: BoxDecoration(
+          color: selected ? _accentGreen.withAlpha(30) : _glassBg,
+          borderRadius: BorderRadius.circular(10),
+          border: Border.all(
+            color: selected ? _accentGreen : _glassBorder,
+            width: selected ? 1.5 : 1,
+          ),
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            if (icon != null) ...[
+              Icon(icon, color: selected ? _accentGreen : _textSecondary, size: 20),
+              const SizedBox(height: 4),
+            ],
+            Text(
+              label,
+              textAlign: TextAlign.center,
+              style: GoogleFonts.rajdhani(
+                fontSize: 14,
+                 fontWeight: FontWeight.w700,
+                 color: selected ? _accentGreen : _textSecondary,
+               ),
+             ),
+           ],
+         ),
+       ),
+     );
+   }
+ }
+
+// ══════════════════════════════════════════════════════════════════════════════
+// MANAGE PLAYER BOTTOM SHEET
+// ══════════════════════════════════════════════════════════════════════════════
+
+class _ManagePlayerSheet extends StatelessWidget {
+  const _ManagePlayerSheet({
+    required this.strikerName,
+    required this.onRetireHurt,
+    required this.onRetireOut,
+    required this.onChangeBowler,
+    required this.onDeclare,
+  });
+
+  final String strikerName;
+  final VoidCallback onRetireHurt;
+  final VoidCallback onRetireOut;
+  final VoidCallback onChangeBowler;
+  final VoidCallback onDeclare;
+
+  @override
+  Widget build(BuildContext context) {
+    return ClipRRect(
+      borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
+      child: BackdropFilter(
+        filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+        child: Container(
+          decoration: BoxDecoration(
+            color: _surfaceCard.withAlpha(240),
+            borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
+            border: Border.all(color: _glassBorder),
+          ),
+          padding: const EdgeInsets.fromLTRB(20, 20, 20, 32),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // Handle
+              Center(
+                child: Container(
+                  width: 40,
+                  height: 4,
+                  decoration: BoxDecoration(
+                    color: _borderSubtle,
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 16),
+
+              // Header
+              Row(
+                children: [
+                  Container(
+                    padding: const EdgeInsets.all(8),
+                    decoration: BoxDecoration(
+                      color: _accentGreen.withAlpha(30),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: const Icon(Icons.manage_accounts, color: _accentGreen, size: 20),
+                  ),
+                  const SizedBox(width: 12),
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'MANAGE PLAYER',
+                        style: GoogleFonts.rajdhani(
+                          fontSize: 10,
+                          fontWeight: FontWeight.w700,
+                          color: _accentGreen,
+                          letterSpacing: 2,
+                        ),
+                      ),
+                      Text(
+                        strikerName,
+                        style: GoogleFonts.rajdhani(
+                          fontSize: 18,
+                          fontWeight: FontWeight.w800,
+                          color: _textPrimary,
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+              const SizedBox(height: 20),
+
+              // Options
+              _ManageOption(
+                icon: Icons.healing,
+                label: 'Retire Hurt',
+                description: 'Player leaves due to injury — can return later',
+                color: _extrasAmber,
+                onTap: onRetireHurt,
+              ),
+              const SizedBox(height: 10),
+              _ManageOption(
+                icon: Icons.exit_to_app,
+                label: 'Retire Out',
+                description: 'Player voluntarily retires — cannot return',
+                color: _wicketRed,
+                onTap: onRetireOut,
+              ),
+              const SizedBox(height: 10),
+              _ManageOption(
+                icon: Icons.swap_horiz,
+                label: 'Change Bowler (Injury)',
+                description: 'Replace current bowler mid-over, no ball recorded',
+                color: const Color(0xFF64B5F6),
+                onTap: onChangeBowler,
+              ),
+              const SizedBox(height: 10),
+              _ManageOption(
+                icon: Icons.flag,
+                label: 'Declare Innings',
+                description: 'Batting team declares — innings ends immediately',
+                color: _wicketRed,
+                onTap: onDeclare,
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ManageOption extends StatelessWidget {
+  const _ManageOption({
+    required this.icon,
+    required this.label,
+    required this.description,
+    required this.color,
+    required this.onTap,
+  });
+
+  final IconData icon;
+  final String label;
+  final String description;
+  final Color color;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
+        decoration: BoxDecoration(
+          color: color.withAlpha(15),
+          borderRadius: BorderRadius.circular(12),
+          border: Border.all(color: color.withAlpha(60), width: 1),
+        ),
+        child: Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: color.withAlpha(30),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Icon(icon, color: color, size: 18),
+            ),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    label,
+                    style: GoogleFonts.rajdhani(
+                      fontSize: 15,
+                      fontWeight: FontWeight.w700,
+                      color: color,
+                    ),
+                  ),
+                  Text(
+                    description,
+                    style: GoogleFonts.rajdhani(
+                      fontSize: 12,
+                      color: _textSecondary,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            Icon(Icons.chevron_right, color: color.withAlpha(150), size: 18),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// CHANGE BOWLER MID-OVER SHEET
+// ══════════════════════════════════════════════════════════════════════════════
+
+class _ChangeBowlerSheet extends StatefulWidget {
+  const _ChangeBowlerSheet({required this.onConfirm});
+
+  final void Function(String name) onConfirm;
+
+  @override
+  State<_ChangeBowlerSheet> createState() => _ChangeBowlerSheetState();
+}
+
+class _ChangeBowlerSheetState extends State<_ChangeBowlerSheet> {
+  final _controller = TextEditingController();
+  final _formKey = GlobalKey<FormState>();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _handleSubmit() {
+    if (!_formKey.currentState!.validate()) return;
+    final name = _controller.text.trim();
+    widget.onConfirm(name);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
+      child: ClipRRect(
+        borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
+        child: BackdropFilter(
+          filter: ImageFilter.blur(sigmaX: 10, sigmaY: 10),
+          child: Container(
+            decoration: BoxDecoration(
+              color: _surfaceCard.withAlpha(240),
+              borderRadius: const BorderRadius.vertical(top: Radius.circular(20)),
+              border: Border.all(color: _glassBorder),
+            ),
+            padding: const EdgeInsets.all(24),
+            child: Form(
+              key: _formKey,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // Handle
+                  Center(
+                    child: Container(
+                      width: 40,
+                      height: 4,
+                      decoration: BoxDecoration(
+                        color: _borderSubtle,
+                        borderRadius: BorderRadius.circular(2),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+
+                  // Header
+                  Row(
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.all(10),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF64B5F6).withAlpha(30),
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: const Icon(Icons.swap_horiz, color: Color(0xFF64B5F6), size: 24),
+                      ),
+                      const SizedBox(width: 14),
+                      Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            'MID-OVER CHANGE',
+                            style: GoogleFonts.rajdhani(
+                              fontSize: 10,
+                              fontWeight: FontWeight.w700,
+                              color: const Color(0xFF64B5F6),
+                              letterSpacing: 2,
+                            ),
+                          ),
+                          Text(
+                            'New Bowler',
+                            style: GoogleFonts.rajdhani(
+                              fontSize: 20,
+                              fontWeight: FontWeight.w800,
+                              color: _textPrimary,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 20),
+
+                  // Input
+                  TextFormField(
+                    controller: _controller,
+                    autofocus: true,
+                    style: GoogleFonts.rajdhani(
+                      fontSize: 18,
+                      fontWeight: FontWeight.w700,
+                      color: _textPrimary,
+                    ),
+                    decoration: InputDecoration(
+                      labelText: 'Bowler Name',
+                      hintText: 'Enter replacement bowler name',
+                      labelStyle: GoogleFonts.rajdhani(
+                        color: _textSecondary,
+                        fontWeight: FontWeight.w600,
+                      ),
+                      hintStyle: GoogleFonts.rajdhani(
+                        color: _textSecondary.withAlpha(100),
+                      ),
+                      prefixIcon: const Icon(Icons.sports_cricket, color: Color(0xFF64B5F6), size: 22),
+                      filled: true,
+                      fillColor: _surfaceDark,
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide: BorderSide(color: _borderSubtle),
+                      ),
+                      enabledBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide: BorderSide(color: _borderSubtle),
+                      ),
+                      focusedBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide: const BorderSide(color: Color(0xFF64B5F6), width: 2),
+                      ),
+                      contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+                    ),
+                    validator: (v) {
+                      if ((v?.trim() ?? '').isEmpty) return 'Enter bowler name';
+                      return null;
+                    },
+                    textCapitalization: TextCapitalization.words,
+                    onFieldSubmitted: (_) => _handleSubmit(),
+                  ),
+                  const SizedBox(height: 20),
+
+                  SizedBox(
+                    width: double.infinity,
+                    height: 54,
+                    child: ElevatedButton.icon(
+                      onPressed: _handleSubmit,
+                      icon: const Icon(Icons.check, size: 22),
+                      label: Text(
+                        'CONFIRM BOWLER CHANGE',
+                        style: GoogleFonts.rajdhani(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w800,
+                          letterSpacing: 1,
+                        ),
+                      ),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: const Color(0xFF64B5F6),
                         foregroundColor: Colors.white,
                         shape: RoundedRectangleBorder(
                           borderRadius: BorderRadius.circular(12),

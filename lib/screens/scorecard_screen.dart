@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
 
 import '../services/database_helper.dart';
+import '../services/sync_service.dart';
 import 'player_profile_screen.dart';
 import 'team_history_screen.dart';
 
@@ -101,6 +103,82 @@ class _ExtrasRow {
   }
 }
 
+class _CommentaryEntry {
+  final int innings;
+  final int overNum;
+  final int ballNum;
+  final String bowlerName;
+  final String strikerName;
+  final int runsScored;
+  final int extraRuns;
+  final String? extraType;
+  final bool isBoundary;
+  final bool isWicket;
+  final String? wicketType;
+  final String? outPlayerName;
+
+  _CommentaryEntry({
+    required this.innings,
+    required this.overNum,
+    required this.ballNum,
+    required this.bowlerName,
+    required this.strikerName,
+    required this.runsScored,
+    required this.extraRuns,
+    this.extraType,
+    required this.isBoundary,
+    required this.isWicket,
+    this.wicketType,
+    this.outPlayerName,
+  });
+
+  /// Human-readable outcome description.
+  String get outcomeText {
+    if (isWicket) {
+      final who = outPlayerName ?? strikerName;
+      final how = wicketType != null
+          ? wicketType!.replaceAll('_', ' ').toUpperCase()
+          : 'OUT';
+      return '$who $how!';
+    }
+    if (extraType == 'wide') {
+      return extraRuns > 1 ? '$extraRuns wide' : 'Wide';
+    }
+    if (extraType == 'no_ball') {
+      return runsScored > 0 ? '$runsScored+NB' : 'No Ball';
+    }
+    if (extraType == 'bye' || extraType == 'leg_bye') {
+      final label = extraType == 'bye' ? 'Bye' : 'Leg Bye';
+      return extraRuns > 1 ? '$extraRuns $label' : label;
+    }
+    if (isBoundary && runsScored == 6) return 'SIX!';
+    if (isBoundary && runsScored == 4) return 'FOUR!';
+    if (runsScored == 0) return 'Dot';
+    return '$runsScored run${runsScored > 1 ? 's' : ''}';
+  }
+
+  /// Full formatted commentary line.
+  /// overNum is 1-based in DB; display as 0-based (first over = 0.x).
+  String get line =>
+      '${overNum - 1}.$ballNum - $bowlerName to $strikerName, $outcomeText';
+}
+
+class _FowEntry {
+  final int score;      // running total at moment of wicket
+  final int wicketNum;  // 1, 2, 3 …
+  final String batter;  // dismissed player name
+  final int overNum;    // 1-based from DB (display as overNum-1)
+  final int ballNum;
+
+  const _FowEntry({
+    required this.score,
+    required this.wicketNum,
+    required this.batter,
+    required this.overNum,
+    required this.ballNum,
+  });
+}
+
 class _InningsData {
   final List<_BatterRow> batters;
   final List<_BowlerRow> bowlers;
@@ -108,6 +186,7 @@ class _InningsData {
   final int totalRuns;
   final int totalWickets;
   final int legalBalls;
+  final List<_FowEntry> fow;
 
   _InningsData({
     required this.batters,
@@ -116,6 +195,7 @@ class _InningsData {
     required this.totalRuns,
     required this.totalWickets,
     required this.legalBalls,
+    required this.fow,
   });
 
   String get oversString {
@@ -156,10 +236,13 @@ class _ScorecardScreenState extends State<ScorecardScreen>
   // Which team batted in each innings (resolved from toss data)
   final List<String> _battingTeams = ['', ''];
 
+  // Commentary — all deliveries in chronological order
+  List<_CommentaryEntry> _commentary = [];
+
   @override
   void initState() {
     super.initState();
-    _tabController = TabController(length: 2, vsync: this);
+    _tabController = TabController(length: 3, vsync: this);
     _loadScorecardData();
   }
 
@@ -179,7 +262,9 @@ class _ScorecardScreenState extends State<ScorecardScreen>
 
       // Fetch match row to determine which team batted in each innings
       final matchRow = await db.fetchMatch(widget.matchId);
+      String? matchUuid;
       if (matchRow != null) {
+        matchUuid = matchRow[DatabaseHelper.colUuid] as String?;
         final tossWinner = matchRow[DatabaseHelper.colTossWinner] as String?;
         final optTo      = matchRow[DatabaseHelper.colOptTo]      as String?;
         final teamA      = matchRow[DatabaseHelper.colTeamA]      as String;
@@ -203,10 +288,19 @@ class _ScorecardScreenState extends State<ScorecardScreen>
         _battingTeams[1] = widget.teamB;
       }
 
-      // Load both innings
+      // Pull ball_events from Supabase for non-local matches (viewer sync).
+      // This is a no-op if offline or if local rows already exist.
+      if (matchUuid != null && matchUuid.isNotEmpty) {
+        await SyncService.instance.syncDownBallEvents(matchUuid);
+      }
+
+      // Load both innings scorecard data
       for (int inn = 1; inn <= 2; inn++) {
         _innings[inn - 1] = await _buildInningsData(db, widget.matchId, inn);
       }
+
+      // Load commentary (all innings, newest delivery last)
+      _commentary = await _buildCommentary(db, widget.matchId);
     } catch (e) {
       _error = e.toString();
     }
@@ -245,6 +339,11 @@ class _ScorecardScreenState extends State<ScorecardScreen>
     int wides = 0, noBalls = 0, byes = 0, legByes = 0, penalty = 0;
     int totalRuns = 0, totalWickets = 0, legalBalls = 0;
 
+    // ── Fall of Wickets accumulator ───────────────────────────────────────
+    int fowRunning = 0;
+    // Stores (runningScore, wicketNum, outPlayerId, overNum, ballNum) per wicket
+    final List<Map<String, dynamic>> fowRaw = [];
+
     // ── Dismissal tracking ────────────────────────────────────────────────
     // outPlayerId → dismissal string parts (filled in pass-2 after names resolved)
     final Map<int, Map<String, dynamic>> dismissalRaw = {};
@@ -264,8 +363,20 @@ class _ScorecardScreenState extends State<ScorecardScreen>
 
       // ── Total running ──────────────────────────────────────────────────
       totalRuns += runsScored + extraRuns;
+      fowRunning += runsScored + extraRuns;
       if (isLegal) legalBalls++;
       if (isWicket) totalWickets++;
+
+      // ── Fall of Wickets capture ────────────────────────────────────────
+      if (isWicket && outPlayerId != null) {
+        fowRaw.add({
+          'score':      fowRunning,
+          'wicketNum':  totalWickets,
+          'outPlayer':  outPlayerId,
+          'overNum':    (e[DatabaseHelper.colOverNum] as int?) ?? 1,
+          'ballNum':    (e[DatabaseHelper.colBallNum] as int?) ?? 0,
+        });
+      }
 
       // ── Extras breakdown ──────────────────────────────────────────────
       if (extraType != null && extraRuns > 0) {
@@ -445,6 +556,20 @@ class _ScorecardScreenState extends State<ScorecardScreen>
       ));
     }
 
+    // ── Build FOW entries ─────────────────────────────────────────────────
+    final List<_FowEntry> fowEntries = [];
+    for (final f in fowRaw) {
+      final pid  = f['outPlayer'] as int;
+      final name = nameCache[pid] ?? await playerName(pid);
+      fowEntries.add(_FowEntry(
+        score:     f['score']     as int,
+        wicketNum: f['wicketNum'] as int,
+        batter:    name,
+        overNum:   f['overNum']   as int,
+        ballNum:   f['ballNum']   as int,
+      ));
+    }
+
     return _InningsData(
       batters:       batterRows,
       bowlers:       bowlerRows,
@@ -458,7 +583,32 @@ class _ScorecardScreenState extends State<ScorecardScreen>
       totalRuns:     totalRuns,
       totalWickets:  totalWickets,
       legalBalls:    legalBalls,
+      fow:           fowEntries,
     );
+  }
+
+  /// Build commentary entries for all innings using a single JOIN query.
+  Future<List<_CommentaryEntry>> _buildCommentary(
+    DatabaseHelper db,
+    int matchId,
+  ) async {
+    final rows = await db.getBallEventsWithPlayerNames(matchId);
+    return rows.map((r) {
+      return _CommentaryEntry(
+        innings:       (r[DatabaseHelper.colInnings]   as int?) ?? 1,
+        overNum:       (r[DatabaseHelper.colOverNum]   as int?) ?? 0,
+        ballNum:       (r[DatabaseHelper.colBallNum]   as int?) ?? 0,
+        bowlerName:    (r['bowler_name']               as String?) ?? 'Unknown',
+        strikerName:   (r['striker_name']              as String?) ?? 'Unknown',
+        runsScored:    (r[DatabaseHelper.colRunsScored] as int?) ?? 0,
+        extraRuns:     (r[DatabaseHelper.colExtraRuns]  as int?) ?? 0,
+        extraType:     r[DatabaseHelper.colExtraType]  as String?,
+        isBoundary:    ((r[DatabaseHelper.colIsBoundary] as int?) ?? 0) == 1,
+        isWicket:      ((r[DatabaseHelper.colIsWicket]   as int?) ?? 0) == 1,
+        wicketType:    r[DatabaseHelper.colWicketType] as String?,
+        outPlayerName: r['out_player_name']            as String?,
+      );
+    }).toList();
   }
 
   // ── Build ─────────────────────────────────────────────────────────────────
@@ -507,6 +657,14 @@ class _ScorecardScreenState extends State<ScorecardScreen>
           ),
         ],
       ),
+      actions: [
+        if (!_loading && _error == null)
+          IconButton(
+            icon: const Icon(Icons.share_outlined, color: _accentGreen),
+            tooltip: 'Share scorecard',
+            onPressed: _shareScorecard,
+          ),
+      ],
       bottom: PreferredSize(
         preferredSize: const Size.fromHeight(48),
         child: Container(
@@ -533,9 +691,91 @@ class _ScorecardScreenState extends State<ScorecardScreen>
             tabs: [
               Tab(text: '1ST INNINGS'),
               Tab(text: '2ND INNINGS'),
+              Tab(text: 'COMMENTARY'),
             ],
           ),
         ),
+      ),
+    );
+  }
+
+  // ── Share Scorecard ───────────────────────────────────────────────────────
+
+  void _shareScorecard() {
+    final buf = StringBuffer();
+    buf.writeln('🏏 BooknScore Scorecard');
+    buf.writeln('${widget.teamA} vs ${widget.teamB}');
+    buf.writeln('─' * 32);
+
+    for (int i = 0; i < 2; i++) {
+      final data = _innings[i];
+      final team = _battingTeams[i];
+      if (data == null) continue;
+
+      buf.writeln('\n${i == 0 ? '1st' : '2nd'} Innings: $team');
+      buf.writeln('${data.totalRuns}/${data.totalWickets} (${data.oversString} ov)');
+
+      // Top batters (those who scored or faced balls)
+      final notable = data.batters
+          .where((b) => b.runs > 0 || b.balls > 0)
+          .toList();
+      if (notable.isNotEmpty) {
+        buf.writeln('  Batting:');
+        for (final b in notable) {
+          final sr = b.balls > 0
+              ? '  SR: ${b.strikeRate.toStringAsFixed(1)}'
+              : '';
+          buf.writeln('  ${b.name}: ${b.runs} (${b.balls})$sr');
+        }
+      }
+
+      // Top bowlers
+      final bowlers = data.bowlers.where((b) => b.overs > 0 || b.ballsExtra > 0).toList();
+      if (bowlers.isNotEmpty) {
+        buf.writeln('  Bowling:');
+        for (final b in bowlers) {
+          buf.writeln('  ${b.name}: ${b.wickets}/${b.runs} (${b.oversString} ov)');
+        }
+      }
+    }
+
+    // Result line
+    final inn1 = _innings[0];
+    final inn2 = _innings[1];
+    if (inn1 != null && inn2 != null) {
+      buf.writeln('\n─' * 16);
+      if (inn1.totalRuns > inn2.totalRuns) {
+        final margin = inn1.totalRuns - inn2.totalRuns;
+        buf.writeln('Result: ${_battingTeams[0]} won by $margin runs');
+      } else if (inn2.totalRuns > inn1.totalRuns) {
+        final wktsLeft = 10 - inn2.totalWickets;
+        buf.writeln('Result: ${_battingTeams[1]} won by $wktsLeft wickets');
+      } else {
+        buf.writeln('Result: Match tied');
+      }
+    }
+
+    buf.writeln('\nScored with BooknScore');
+
+    Clipboard.setData(ClipboardData(text: buf.toString()));
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            const Icon(Icons.check_circle_outline, color: Colors.white, size: 18),
+            const SizedBox(width: 10),
+            Expanded(
+              child: Text(
+                'Scorecard copied to clipboard',
+                style: GoogleFonts.rajdhani(fontWeight: FontWeight.w600),
+              ),
+            ),
+          ],
+        ),
+        backgroundColor: _accentGreen.withAlpha(200),
+        behavior: SnackBarBehavior.floating,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+        margin: const EdgeInsets.all(16),
       ),
     );
   }
@@ -559,6 +799,7 @@ class _ScorecardScreenState extends State<ScorecardScreen>
       children: [
         _buildInningsTab(0),
         _buildInningsTab(1),
+        _buildCommentaryTab(),
       ],
     );
   }
@@ -597,7 +838,223 @@ class _ScorecardScreenState extends State<ScorecardScreen>
           // ── Bowling table ─────────────────────────────────────────────
           _buildSectionLabel('BOWLING'),
           _buildBowlingTable(data.bowlers),
+
+          // ── Fall of Wickets ───────────────────────────────────────────
+          _buildSectionLabel('FALL OF WICKETS'),
+          _buildFowSection(data.fow),
           const SizedBox(height: 32),
+        ],
+      ),
+    );
+  }
+
+  // ── Fall of Wickets section ───────────────────────────────────────────────
+
+  Widget _buildFowSection(List<_FowEntry> fow) {
+    return Container(
+      margin: const EdgeInsets.fromLTRB(12, 6, 12, 0),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: _surfaceCard,
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: _glassBorder, width: 1),
+      ),
+      child: fow.isEmpty
+          ? Text(
+              'No wickets',
+              style: GoogleFonts.rajdhani(
+                fontSize: 13,
+                color: _textMuted,
+              ),
+            )
+          : SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                children: [
+                  for (int i = 0; i < fow.length; i++) ...[
+                    _buildFowChip(fow[i]),
+                    if (i < fow.length - 1)
+                      Container(
+                        width: 1,
+                        height: 28,
+                        margin: const EdgeInsets.symmetric(horizontal: 8),
+                        color: _dividerColor,
+                      ),
+                  ],
+                ],
+              ),
+            ),
+    );
+  }
+
+  Widget _buildFowChip(_FowEntry f) {
+    final overDisplay = '${f.overNum - 1}.${f.ballNum}';
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: _wicketRed.withAlpha(25),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: _wicketRed.withAlpha(80), width: 1),
+      ),
+      child: RichText(
+        text: TextSpan(
+          style: GoogleFonts.robotoMono(fontSize: 12),
+          children: [
+            TextSpan(
+              text: '${f.score}-${f.wicketNum}',
+              style: const TextStyle(
+                color: _wicketRed,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            TextSpan(
+              text: ' (${f.batter}, $overDisplay)',
+              style: const TextStyle(color: _textSecondary),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ── Commentary tab ────────────────────────────────────────────────────────
+
+  Widget _buildCommentaryTab() {
+    if (_commentary.isEmpty) {
+      return Center(
+        child: Text(
+          'No ball-by-ball data available yet.',
+          style: GoogleFonts.rajdhani(color: _textSecondary, fontSize: 16),
+        ),
+      );
+    }
+
+    // Show newest delivery at the top
+    final entries = _commentary.reversed.toList();
+
+    return ListView.builder(
+      padding: const EdgeInsets.symmetric(vertical: 8),
+      itemCount: entries.length,
+      itemBuilder: (_, i) => _buildCommentaryRow(entries[i]),
+    );
+  }
+
+  Widget _buildCommentaryRow(_CommentaryEntry entry) {
+    final outcome = entry.outcomeText;
+    final isWicket   = entry.isWicket;
+    final isSix      = outcome == 'SIX!';
+    final isFour     = outcome == 'FOUR!';
+    final isExtra    = entry.extraType != null;
+
+    final Color accentColor = isWicket
+        ? _wicketRed
+        : isSix
+            ? _sixPurple
+            : isFour
+                ? _boundaryBlue
+                : isExtra
+                    ? const Color(0xFFFFB300) // amber
+                    : _textMuted;
+
+    final bool isHighlight = isWicket || isSix || isFour;
+
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+      decoration: BoxDecoration(
+        color: isHighlight
+            ? accentColor.withAlpha(18)
+            : _surfaceCard,
+        borderRadius: BorderRadius.circular(8),
+        border: Border(
+          left: BorderSide(
+            color: accentColor,
+            width: isHighlight ? 3 : 2,
+          ),
+        ),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // Over.ball badge — overNum is 1-based in DB; display 0-based
+          Container(
+            width: 40,
+            alignment: Alignment.center,
+            child: Text(
+              '${entry.overNum - 1}.${entry.ballNum}',
+              style: GoogleFonts.robotoMono(
+                fontSize: 12,
+                fontWeight: FontWeight.w700,
+                color: accentColor,
+              ),
+            ),
+          ),
+          const SizedBox(width: 10),
+          // Commentary text
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                RichText(
+                  text: TextSpan(
+                    style: GoogleFonts.rajdhani(
+                      fontSize: 14,
+                      color: _textSecondary,
+                    ),
+                    children: [
+                      TextSpan(
+                        text: '${entry.bowlerName} ',
+                        style: const TextStyle(color: _textPrimary),
+                      ),
+                      const TextSpan(text: 'to '),
+                      TextSpan(
+                        text: entry.strikerName,
+                        style: const TextStyle(color: _textPrimary),
+                      ),
+                      const TextSpan(text: ', '),
+                      TextSpan(
+                        text: outcome,
+                        style: TextStyle(
+                          color: accentColor,
+                          fontWeight: isHighlight
+                              ? FontWeight.w700
+                              : FontWeight.w500,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                // Innings label for first ball of each innings
+                // overNum is 1-based in DB; first ball is overNum==1, ballNum==1
+                if (entry.overNum == 1 && entry.ballNum == 1)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 3),
+                    child: Text(
+                      'INNINGS ${entry.innings}',
+                      style: GoogleFonts.rajdhani(
+                        fontSize: 10,
+                        color: entry.innings == 1 ? _inn1Color : _inn2Color,
+                        letterSpacing: 1.2,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+          // Runs pill
+          Container(
+            width: 32,
+            alignment: Alignment.center,
+            child: Text(
+              isWicket ? 'W' : isExtra ? 'E' : '${entry.runsScored}',
+              style: GoogleFonts.robotoMono(
+                fontSize: 13,
+                fontWeight: FontWeight.w700,
+                color: accentColor,
+              ),
+            ),
+          ),
         ],
       ),
     );
